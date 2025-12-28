@@ -1,5 +1,6 @@
 #pragma once
 
+#include <boost/container/string.hpp>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -66,6 +67,18 @@ class FixedString {
   friend bool operator==(const std::string_view& lhs, const FixedString& rhs);
   friend bool operator==(const FixedString& lhs, const char* rhs);
   friend bool operator==(const char* lhs, const FixedString& rhs);
+
+  template <class Allocator>
+  friend bool operator==(const FixedString& lhs,
+                         const boost::container::basic_string<char, std::char_traits<char>, Allocator>& rhs) {
+    return lhs == std::string_view{rhs.data(), rhs.size()};
+  }
+
+  template <class Allocator>
+  friend bool operator==(const boost::container::basic_string<char, std::char_traits<char>, Allocator>& lhs,
+                         const FixedString& rhs) {
+    return rhs == lhs;
+  }
 
   // Prints FixedString as string
   friend std::ostream& operator<<(std::ostream& stream, const FixedString& obj);

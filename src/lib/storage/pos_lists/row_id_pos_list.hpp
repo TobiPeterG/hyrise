@@ -131,4 +131,14 @@ class RowIDPosList final : public AbstractPosList, private pmr_vector<RowID> {
   bool _references_single_chunk = false;
 };
 
+inline bool operator==(const RowIDPosList& lhs, const RowIDPosList& rhs) {
+  // Compare via AbstractPosList to keep semantics consistent
+  return static_cast<const AbstractPosList&>(lhs) ==
+         static_cast<const AbstractPosList&>(rhs);
+}
+
+inline bool operator!=(const RowIDPosList& lhs, const RowIDPosList& rhs) {
+  return !(lhs == rhs);
+}
+
 }  // namespace hyrise

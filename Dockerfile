@@ -3,7 +3,12 @@
 # https://github.com/hyrise/hyrise/wiki/Docker-Image
 
 FROM ubuntu:22.04
-ENV DEBIAN_FRONTEND noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG USERNAME=hyrise
+ARG UID=1000
+ARG GID=1000
+
 RUN apt-get update \
     && apt-get install -y \
     autoconf \
@@ -45,7 +50,6 @@ RUN apt-get update \
     linux-tools-common \
     linux-tools-generic \
     linux-cloud-tools-generic \
-    linux-tools-`uname -r` \
     bpftrace \
     lldb \
     fio \
@@ -54,9 +58,29 @@ RUN apt-get update \
     ninja-build \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
-    && ln -sf /usr/bin/llvm-symbolizer-14 /usr/bin/llvm-symbolizer \
-    && pip3 install scipy pandas matplotlib # preload large Python packages (installs numpy and others)
-RUN cd /home && curl -L  http://downloads.sourceforge.net/project/boost/boost/1.81.0/boost_1_81_0.tar.gz --output boost_1_81_0.tar.gz  \
+    && pip3 install scipy pandas matplotlib
+
+RUN set -eux; \
+    if getent group "${GID}" >/dev/null 2>&1; then \
+      EXISTING_GROUP="$(getent group "${GID}" | cut -d: -f1)"; \
+      groupmod -n "${USERNAME}" "${EXISTING_GROUP}"; \
+      GROUP_NAME="${USERNAME}"; \
+    else \
+      groupadd -g "${GID}" "${USERNAME}"; \
+      GROUP_NAME="${USERNAME}"; \
+    fi; \
+    if getent passwd "${UID}" >/dev/null 2>&1; then \
+      EXISTING_USER="$(getent passwd "${UID}" | cut -d: -f1)"; \
+      usermod -l "${USERNAME}" -d "/home/${USERNAME}" -m -g "${GROUP_NAME}" "${EXISTING_USER}"; \
+    else \
+      useradd -m -u "${UID}" -g "${GROUP_NAME}" -s /bin/bash "${USERNAME}"; \
+    fi; \
+    usermod -aG sudo "${USERNAME}"; \
+    echo '%sudo ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-nopasswd-sudo; \
+    chmod 0440 /etc/sudoers.d/90-nopasswd-sudo; \
+    visudo -cf /etc/sudoers
+
+RUN cd /home && curl -L http://downloads.sourceforge.net/project/boost/boost/1.81.0/boost_1_81_0.tar.gz --output boost_1_81_0.tar.gz \
   && tar xfz boost_1_81_0.tar.gz \
   && rm boost_1_81_0.tar.gz \
   && cd boost_1_81_0 \
@@ -64,5 +88,8 @@ RUN cd /home && curl -L  http://downloads.sourceforge.net/project/boost/boost/1.
   && ./b2 install \
   && cd /home \
   && rm -rf boost_1_81_0
-RUN curl -fsSL https://code-server.dev/install.sh | sh
+
 ENV HYRISE_HEADLESS_SETUP=true
+
+USER ${USERNAME}
+WORKDIR /workspace/hyrise

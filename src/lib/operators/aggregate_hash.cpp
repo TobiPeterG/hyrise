@@ -269,7 +269,7 @@ KeysPerChunk<AggregateKey> AggregateHash::_partition_by_groupby_keys() {
   auto pin_guard = AllocatorPinGuard{allocator};
 
   KeysPerChunk<AggregateKey> keys_per_chunk{allocator};
-  auto keys_per_chunk = KeysPerChunk<AggregateKey>{};
+  //auto keys_per_chunk = KeysPerChunk<AggregateKey>{};
 
   if constexpr (!std::is_same_v<AggregateKey, EmptyAggregateKey>) {
     const auto& input_table = left_input_table();
