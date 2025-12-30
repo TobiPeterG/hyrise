@@ -110,7 +110,7 @@ class BufferManager : public boost::container::pmr::memory_resource, public Nonc
 
   void add_to_eviction_queue(const PageID page_id, Frame* frame);
 
-  Config _config;  // TODO: Const
+    Config _config;  // TODO: Const
 
   std::byte* _mapped_region;
 
@@ -119,10 +119,33 @@ class BufferManager : public boost::container::pmr::memory_resource, public Nonc
   std::array<std::shared_ptr<VolatileRegion>, NUM_PAGE_SIZE_TYPES> _volatile_regions;
 
   std::shared_ptr<SSDRegion> _ssd_region;
-
+  std::shared_ptr<BufferPool> _primary_buffer_pool;
   std::shared_ptr<BufferPool> _secondary_buffer_pool;
 
-  std::shared_ptr<BufferPool> _primary_buffer_pool;
+#ifndef NDEBUG
+  std::string debug_perms(void* addr) const;
+#endif
+
+ private:
+#ifndef NDEBUG
+  struct AllocationRecord {
+    std::size_t requested_bytes{};
+    PageID page_id{MIN_PAGE_SIZE_TYPE, 0, false};
+    std::vector<void*> backtrace_addrs;
+  };
+
+  void _track_allocation(void* ptr, std::size_t requested_bytes, const PageID& page_id);
+  void _untrack_allocation(void* ptr);
+  void _dump_tracked_allocations() const;
+
+  mutable std::mutex _alloc_track_mutex;
+  std::unordered_map<void*, AllocationRecord> _allocations_by_ptr;
+#endif
+
+#ifndef NDEBUG
+ public:
+  std::byte* debug_mapped_region_base() const { return _mapped_region; }
+#endif
 };
 
 template <typename T>

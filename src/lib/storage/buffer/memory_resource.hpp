@@ -53,6 +53,8 @@ class LinearBufferResource : public boost::container::pmr::memory_resource, publ
 
   std::size_t remaining_storage(std::size_t alignment = 1u) const noexcept;
 
+  void reset() noexcept;
+
  private:
   static AllocationCountType& allocation_count(std::byte* buffer) noexcept;
 

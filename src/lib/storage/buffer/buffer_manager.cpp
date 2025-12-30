@@ -3,12 +3,21 @@
 #include <unistd.h>
 #include <algorithm>
 #include <chrono>
+#ifndef NDEBUG
+#include <execinfo.h>
+#endif
 #include <fstream>
 #include <utility>
 #include "hyrise.hpp"
+#include <iostream>
 #include "storage/buffer/ssd_region.hpp"
 #include "storage/buffer/volatile_region.hpp"
 #include "utils/assert.hpp"
+
+#ifndef NDEBUG
+#include <fstream>
+#include <sstream>
+#endif
 
 namespace hyrise {
 
@@ -84,40 +93,148 @@ BufferManager::BufferManager() : BufferManager(Config::from_env()) {}
 BufferManager::BufferManager(const Config config)
     : _config(config),
       _mapped_region(create_mapped_region()),
-      _volatile_regions(create_volatile_regions(_mapped_region, _metrics)),
-      _ssd_region(std::make_shared<SSDRegion>(config.ssd_path, _metrics)),  // TODO: imprive init of pools here
       _metrics(std::make_shared<BufferManagerMetrics>()),
-      _primary_buffer_pool(std::make_shared<BufferPool>(true, config.dram_buffer_pool_size,
-                                                        config.enable_eviction_purge_worker, _volatile_regions,
-                                                        config.migration_policy, _ssd_region, _secondary_buffer_pool,
-                                                        config.cpu_node, _metrics->dram_buffer_pool_metrics)),
+      _volatile_regions(create_volatile_regions(_mapped_region, _metrics)),
+      _ssd_region(std::make_shared<SSDRegion>(config.ssd_path, _metrics)),
+      _primary_buffer_pool(std::make_shared<BufferPool>(
+          true, config.dram_buffer_pool_size, config.enable_eviction_purge_worker, _volatile_regions,
+          config.migration_policy, _ssd_region, nullptr, config.cpu_node, _metrics->dram_buffer_pool_metrics)),
       _secondary_buffer_pool(std::make_shared<BufferPool>(
           config.enable_numa, config.numa_buffer_pool_size, config.enable_eviction_purge_worker, _volatile_regions,
-          config.migration_policy, _ssd_region, nullptr, config.memory_node, _metrics->numa_buffer_pool_metrics)) {
-  Assert(config.cpu_node != config.memory_node, "CPU and memory node must be different");
+          config.migration_policy, _ssd_region, _primary_buffer_pool, config.memory_node,
+          _metrics->numa_buffer_pool_metrics)) {
+  if (config.enable_numa) {
+    Assert(config.cpu_node != config.memory_node, "CPU and memory node must be different when NUMA is enabled");
+  } else {
+    Assert(config.cpu_node == config.memory_node, "CPU and memory node must be identical when NUMA is disabled");
+  }
 }
 
 BufferManager::~BufferManager() {
+#ifndef NDEBUG
+  _dump_tracked_allocations();
+#endif
   unmap_region(_mapped_region);
 }
 
 BufferManager& BufferManager::operator=(BufferManager&& other) noexcept {
-  if (&other != this) {
-    _config = std::move(other._config);
-    _metrics = other._metrics;
-    _volatile_regions = other._volatile_regions;
-    _ssd_region = other._ssd_region;
-    _primary_buffer_pool = other._primary_buffer_pool;
-    _secondary_buffer_pool = other._secondary_buffer_pool;
-    std::swap(_mapped_region, other._mapped_region);
-    // TODO: check again
+  if (this == &other) {
+    return *this;
   }
+
+  // Release our current mapping first
+  if (_mapped_region) {
+    unmap_region(_mapped_region);
+    _mapped_region = nullptr;
+  }
+
+  _config = std::move(other._config);
+  _metrics = std::move(other._metrics);
+  _volatile_regions = std::move(other._volatile_regions);
+  _ssd_region = std::move(other._ssd_region);
+  _primary_buffer_pool = std::move(other._primary_buffer_pool);
+  _secondary_buffer_pool = std::move(other._secondary_buffer_pool);
+
+  // Take ownership of the mapping
+  _mapped_region = other._mapped_region;
+  other._mapped_region = nullptr;
+
   return *this;
 }
 
 BufferManager& BufferManager::get() {
   return Hyrise::get().buffer_manager;
 }
+
+#ifndef NDEBUG
+void BufferManager::_track_allocation(void* ptr, std::size_t requested_bytes, const PageID& page_id) {
+  if (!ptr) {
+    return;
+  }
+
+  std::vector<void*> addrs;
+  addrs.resize(32);
+  const auto n = ::backtrace(addrs.data(), static_cast<int>(addrs.size()));
+  if (n > 0) {
+    addrs.resize(static_cast<size_t>(n));
+  } else {
+    addrs.clear();
+  }
+
+  std::lock_guard<std::mutex> lock(_alloc_track_mutex);
+  _allocations_by_ptr[ptr] = AllocationRecord{requested_bytes, page_id, std::move(addrs)};
+}
+
+void BufferManager::_untrack_allocation(void* ptr) {
+  if (!ptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(_alloc_track_mutex);
+  _allocations_by_ptr.erase(ptr);
+}
+
+void BufferManager::_dump_tracked_allocations() const {
+  std::lock_guard<std::mutex> lock(_alloc_track_mutex);
+  if (_allocations_by_ptr.empty()) {
+    return;
+  }
+
+  std::cerr << "[BM] WARNING: BufferManager destroyed while allocations are still alive. count="
+            << _allocations_by_ptr.size() << "\n";
+
+  size_t i = 0;
+  for (const auto& [ptr, rec] : _allocations_by_ptr) {
+    std::cerr << "[BM]  leak[" << i++ << "] ptr=" << ptr
+              << " requested_bytes=" << rec.requested_bytes
+              << " page_id=" << rec.page_id << "\n";
+
+    if (!rec.backtrace_addrs.empty()) {
+      char** symbols = ::backtrace_symbols(rec.backtrace_addrs.data(), static_cast<int>(rec.backtrace_addrs.size()));
+      if (symbols) {
+        // Skip frame 0/1 (this function + track helper) for readability
+        for (size_t f = 2; f < rec.backtrace_addrs.size(); ++f) {
+          std::cerr << "    " << symbols[f] << "\n";
+        }
+        std::free(symbols);
+      } else {
+        std::cerr << "    (backtrace_symbols failed)\n";
+      }
+    } else {
+      std::cerr << "    (no backtrace)\n";
+    }
+  }
+}
+#endif
+
+#ifndef NDEBUG
+static std::string _prot_of_addr(void* addr) {
+  std::ifstream maps("/proc/self/maps");
+  std::string line;
+  auto a = reinterpret_cast<uintptr_t>(addr);
+
+  while (std::getline(maps, line)) {
+    // format: start-end perms offset dev inode pathname
+    std::istringstream iss(line);
+    std::string range, perms;
+    if (!(iss >> range >> perms)) continue;
+
+    auto dash = range.find('-');
+    if (dash == std::string::npos) continue;
+
+    auto start = std::stoull(range.substr(0, dash), nullptr, 16);
+    auto end   = std::stoull(range.substr(dash + 1), nullptr, 16);
+
+    if (a >= start && a < end) return perms;   // e.g. "rw-p" or "---p"
+  }
+  return "<not-mapped>";
+}
+#endif
+
+#ifndef NDEBUG
+std::string BufferManager::debug_perms(void* addr) const {
+  return _prot_of_addr(addr);
+}
+#endif
 
 // TODO: This can take several templates to improve branching
 void BufferManager::make_resident(const PageID page_id, const AccessIntent access_intent,
@@ -342,15 +459,34 @@ Frame::StateVersionType BufferManager::_state(const PageID page_id) {
 }
 
 PageID BufferManager::find_page(const void* ptr) const {
-  const auto offset = std::ptrdiff_t{reinterpret_cast<const std::byte*>(ptr) - _mapped_region};
+  if (!_mapped_region || !ptr) {
+    return PageID{MIN_PAGE_SIZE_TYPE, 0, false};
+  }
+
+  const auto base = reinterpret_cast<const std::byte*>(_mapped_region);
+  const auto p = reinterpret_cast<const std::byte*>(ptr);
+
+  // Reject pointers outside our reserved mapping
+  if (p < base || p >= base + DEFAULT_RESERVED_VIRTUAL_MEMORY) {
+    return PageID{MIN_PAGE_SIZE_TYPE, 0, false};
+  }
+
+  const auto offset = std::ptrdiff_t{p - base};
   const auto region_idx = offset / DEFAULT_RESERVED_VIRTUAL_MEMORY_PER_REGION;
-  const auto page_size =
-      bytes_for_size_type(MIN_PAGE_SIZE_TYPE) * (1 << region_idx);  // TODO: this might break if not exponential sizes
+
+  const auto valid = region_idx >= 0 && region_idx < static_cast<std::ptrdiff_t>(NUM_PAGE_SIZE_TYPES);
+  if (!valid) {
+    return PageID{MIN_PAGE_SIZE_TYPE, 0, false};
+  }
+
+  const auto region_idx_u = static_cast<uint64_t>(region_idx);
+  const auto page_size = bytes_for_size_type(MIN_PAGE_SIZE_TYPE) * (uint64_t{1} << region_idx_u);
+
   const auto region_offset = offset % DEFAULT_RESERVED_VIRTUAL_MEMORY_PER_REGION;
-  const auto page_idx = region_offset / page_size;
-  const auto valid = region_idx < NUM_PAGE_SIZE_TYPES && region_idx >= 0;
-  const auto size_type = valid ? magic_enum::enum_value<PageSizeType>(region_idx) : MIN_PAGE_SIZE_TYPE;
-  return PageID{size_type, static_cast<PageID::PageIDType>(page_idx), valid};
+  const auto page_idx = region_offset / static_cast<std::ptrdiff_t>(page_size);
+
+  const auto size_type = magic_enum::enum_value<PageSizeType>(region_idx);
+  return PageID{size_type, static_cast<PageID::PageIDType>(page_idx), true};
 }
 
 void BufferManager::add_to_eviction_queue(const PageID page_id, Frame* frame) {
@@ -365,8 +501,12 @@ void BufferManager::add_to_eviction_queue(const PageID page_id, Frame* frame) {
 }
 
 void* BufferManager::do_allocate(std::size_t bytes, std::size_t alignment) {
-  const auto size_type = find_fitting_page_size_type(bytes);
+  // TODO: Check again
+  if (bytes == 0) {
+    bytes = 1;
+  }
 
+  const auto size_type = find_fitting_page_size_type(bytes);
   auto region = _volatile_regions[static_cast<uint64_t>(size_type)];
   const auto [page_id, frame, ptr] = region->allocate();
 
@@ -375,36 +515,85 @@ void* BufferManager::do_allocate(std::size_t bytes, std::size_t alignment) {
 
   auto state_and_version = frame->state_and_version();
   if (!frame->try_lock_exclusive(state_and_version)) {
-    Fail("Could not lock page for exclusive access. This should not happen during an allocation.");
+    Fail("Could not lock page for exclusive access during allocation.");
   }
 
   region->unprotect_page(page_id);
 
+  // Use either NUMA or DRAM for allocation
+  // TODO: Which one?
+  auto buffer_pool =
+      (_secondary_buffer_pool && _secondary_buffer_pool->enabled && _config.migration_policy.bypass_dram_during_write())
+          ? _secondary_buffer_pool
+          : _primary_buffer_pool;
+
   for (auto repeat = size_t{0}; repeat < MAX_REPEAT_COUNT; ++repeat) {
-    // Use either NUMA or DRAM for allocation
-    // TODO: Which one?
-    auto buffer_pool = _secondary_buffer_pool->enabled && _config.migration_policy.bypass_dram_during_write()
-                           ? _secondary_buffer_pool
-                           : _primary_buffer_pool;
     if (!buffer_pool->ensure_free_pages(page_id.size_type())) {
       yield(repeat);
       continue;
     }
+
     region->mbind_to_numa_node(page_id, buffer_pool->node_id);
-    frame->set_dirty(true);
+
+#ifndef NDEBUG
+    _track_allocation(ptr, bytes, page_id);
+#endif
+
+#ifndef NDEBUG
+  volatile std::byte* probe = ptr;
+  probe[0] = std::byte{0xAB};
+#endif
+
     frame->unlock_exclusive();
-    buffer_pool->add_to_eviction_queue(page_id, frame);
     return ptr;
   }
-  Fail("Could not allocate page on NUMA or DRAM. Try increasing both buffer pool sizes.");
+
+  frame->unlock_exclusive_and_set_evicted();
+  region->deallocate(page_id);
+  Fail("Could not allocate page on NUMA or DRAM. Try increasing buffer pool sizes.");
 }
 
 void BufferManager::do_deallocate(void* p, std::size_t bytes, std::size_t alignment) {
-  // region->deallocate(page_id);
-  // TODO Mark as dealloczed and iulock?
+  // TODO: Check again
+  if (!p) {
+    return;
+  }
+
+#ifndef NDEBUG
+  _untrack_allocation(p);
+#endif
+
   const auto page_id = find_page(p);
-  add_to_eviction_queue(page_id, get_region(page_id)->get_frame(page_id));
-  // TODO: Properly handle deallocation, set to UNLOCKED inisitially
+  if (!page_id.valid()) {
+    Fail("BufferManager::do_deallocate called with pointer not belonging to mapped region");
+  }
+
+  auto region = get_region(page_id);
+  auto frame = region->get_frame(page_id);
+
+  auto state_and_version = frame->state_and_version();
+  while (Frame::state(state_and_version) != Frame::LOCKED) {
+    if (frame->try_lock_exclusive(state_and_version)) {
+      break;
+    }
+    yield(0);
+    state_and_version = frame->state_and_version();
+  }
+
+  const auto num_bytes = bytes_for_size_type(page_id.size_type());
+  if (frame->node_id() == _primary_buffer_pool->node_id) {
+    _primary_buffer_pool->free_bytes(num_bytes);
+  } else if (_secondary_buffer_pool && _secondary_buffer_pool->enabled &&
+             frame->node_id() == _secondary_buffer_pool->node_id) {
+    _secondary_buffer_pool->free_bytes(num_bytes);
+  } else {
+    Fail("Cannot find buffer pool for given memory node " + std::to_string(frame->node_id()));
+  }
+
+  region->free(page_id);
+  region->deallocate(page_id);
+  frame->unlock_exclusive_and_set_evicted();
+
   increment_counter(_metrics->num_deallocs);
 }
 

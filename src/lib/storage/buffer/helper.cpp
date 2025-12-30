@@ -67,4 +67,5 @@ void unmap_region(std::byte* region) {
     Fail("Failed to unmap volatile pool region: " + strerror(error));
   }
 }
+
 }  // namespace hyrise

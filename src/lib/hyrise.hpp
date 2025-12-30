@@ -31,6 +31,13 @@ class Hyrise : public Singleton<Hyrise> {
   // You should be very sure that this is what you want.
   static void reset();
 
+  // Singleton base makes moving the whole Hyrise object impossible/undesirable.
+  Hyrise(Hyrise&&) noexcept = delete;
+  Hyrise& operator=(Hyrise&& other) noexcept;
+
+  Hyrise(const Hyrise&) = delete;
+  Hyrise& operator=(const Hyrise&) = delete;
+
   // The scheduler is always set. However, the ImmediateExecutionScheduler does not involve any multi-threading. This
   // can be tested with is_multi_threaded.
   const std::shared_ptr<AbstractScheduler>& scheduler() const;

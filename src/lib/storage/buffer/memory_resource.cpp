@@ -28,6 +28,12 @@ std::size_t LinearBufferResource::remaining_storage(std::size_t alignment) const
   return remaining_storage(alignment, dummy);
 }
 
+void LinearBufferResource::reset() noexcept {
+  detail::linear_buffer_resource_state.current_buffer = nullptr;
+  detail::linear_buffer_resource_state.current_buffer_pos = 0u;
+  detail::linear_buffer_resource_state.current_buffer_size = 0u;
+}
+
 void* LinearBufferResource::allocate_from_current(std::size_t aligner, std::size_t bytes) {
   const auto buffer_pos = detail::linear_buffer_resource_state.current_buffer_pos + aligner;
   detail::linear_buffer_resource_state.current_buffer_pos = buffer_pos + bytes;
