@@ -55,9 +55,6 @@ Hyrise& Hyrise::operator=(Hyrise&& other) noexcept {
   JemallocMemoryResource::get().reset();
 #endif
 
-  //  Now it should be safe to replace the BufferManager.
-  buffer_manager = BufferManager{};
-
   // Replace the remaining state
   buffer_manager = std::move(other.buffer_manager);
   storage_manager = std::move(other.storage_manager);

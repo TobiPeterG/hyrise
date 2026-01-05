@@ -5,11 +5,13 @@
 #include <chrono>
 #ifndef NDEBUG
 #include <execinfo.h>
+#include <atomic>
 #endif
 #include <fstream>
 #include <utility>
 #include "hyrise.hpp"
 #include <iostream>
+#include "storage/buffer/jemalloc_resource.hpp"
 #include "storage/buffer/ssd_region.hpp"
 #include "storage/buffer/volatile_region.hpp"
 #include "utils/assert.hpp"
@@ -19,10 +21,61 @@
 #include <sstream>
 #endif
 
+#if defined(HYRISE_WITH_JEMALLOC) && !defined(NDEBUG)
+namespace hyrise {
+bool& jemalloc_extent_hooks_tls_flag();
+}  // namespace hyrise
+#endif
+
 namespace hyrise {
 
 // TODO: On Mac, we should use MSYNC to see if a page is still in memory or not to avoid loading from disk
 // TODO: Incluse page size in mihration desction -> large page size should be normalized
+
+#ifndef NDEBUG
+namespace {
+std::mutex s_live_pages_mutex;
+// TODO: Check again
+// Global epoch that advances whenever a new BufferManager mapping is installed.
+// This prevents false positives when the BM mapping base changes but (size_type, index) repeats.
+std::atomic<uint64_t> s_mapping_epoch{0};
+
+static void bump_mapping_epoch() {
+  s_mapping_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+struct LivePageKey {
+  uint64_t epoch;
+  uint8_t size_type;
+  uint64_t index;
+};
+
+struct LivePageKeyHash {
+  size_t operator()(const LivePageKey& k) const noexcept {
+    // Simple mix; collisions are fine because unordered_set also checks equality.
+    size_t h = std::hash<uint64_t>{}(k.epoch);
+    h ^= (static_cast<size_t>(k.size_type) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2));
+    h ^= (std::hash<uint64_t>{}(k.index) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2));
+    return h;
+  }
+};
+
+struct LivePageKeyEq {
+  bool operator()(const LivePageKey& a, const LivePageKey& b) const noexcept {
+    return a.epoch == b.epoch && a.size_type == b.size_type && a.index == b.index;
+  }
+};
+
+std::unordered_set<LivePageKey, LivePageKeyHash, LivePageKeyEq> s_live_pages;
+
+static LivePageKey live_page_key(const PageID& page_id) {
+  return LivePageKey{
+      s_mapping_epoch.load(std::memory_order_relaxed),
+      static_cast<uint8_t>(page_id._size_type),
+      static_cast<uint64_t>(page_id.index)};
+}
+}  // namespace
+#endif
 
 //----------------------------------------------------
 // Config
@@ -103,6 +156,10 @@ BufferManager::BufferManager(const Config config)
           config.enable_numa, config.numa_buffer_pool_size, config.enable_eviction_purge_worker, _volatile_regions,
           config.migration_policy, _ssd_region, _primary_buffer_pool, config.memory_node,
           _metrics->numa_buffer_pool_metrics)) {
+#ifndef NDEBUG
+  bump_mapping_epoch();
+#endif
+
   if (config.enable_numa) {
     Assert(config.cpu_node != config.memory_node, "CPU and memory node must be different when NUMA is enabled");
   } else {
@@ -111,6 +168,11 @@ BufferManager::BufferManager(const Config config)
 }
 
 BufferManager::~BufferManager() {
+#ifdef HYRISE_WITH_JEMALLOC
+  // Drain deferred frees while tracking structures are still alive.
+  JemallocMemoryResource::get().drain_deferred_bm_frees();
+#endif
+
 #ifndef NDEBUG
   _dump_tracked_allocations();
 #endif
@@ -138,6 +200,10 @@ BufferManager& BufferManager::operator=(BufferManager&& other) noexcept {
   // Take ownership of the mapping
   _mapped_region = other._mapped_region;
   other._mapped_region = nullptr;
+
+#ifndef NDEBUG
+  bump_mapping_epoch();
+#endif
 
   return *this;
 }
@@ -252,6 +318,7 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
   }
 
   auto region = get_region(page_id);
+  auto frame = region->get_frame(page_id);  // Required for updating node placement consistently
 
   if (!_secondary_buffer_pool->enabled) {
     // Case 3: The page is not on DRAM and we don't have it on another memory node, so we need to load it from SSD
@@ -263,6 +330,10 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
         continue;
       }
       _ssd_region->read_page(page_id, region->get_page(page_id));
+
+      // Required: page is now resident on DRAM
+      frame->set_node_id(_primary_buffer_pool->node_id);
+
       increment_counter(_metrics->total_misses);
       increment_counter(_metrics->total_bytes_copied_from_ssd_to_dram, page_id.num_bytes());
       return;
@@ -287,6 +358,10 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
           continue;
         }
         region->mbind_to_numa_node(page_id, _primary_buffer_pool->node_id);
+
+        // Required
+        frame->set_node_id(_primary_buffer_pool->node_id);
+
         increment_counter(_metrics->total_bytes_copied_from_ssd_to_dram, page_id.num_bytes());
       } else {
         // Case 4.2: We bypass load the page into NUMA
@@ -295,6 +370,10 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
           continue;
         }
         region->mbind_to_numa_node(page_id, _secondary_buffer_pool->node_id);
+
+        // Required
+        frame->set_node_id(_secondary_buffer_pool->node_id);
+
         increment_counter(_metrics->total_bytes_copied_from_ssd_to_numa, page_id.num_bytes());
       }
       _ssd_region->read_page(page_id, region->get_page(page_id));
@@ -323,6 +402,10 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
       }
       _secondary_buffer_pool->free_bytes(bytes_for_size_type(page_id.size_type()));
       region->mbind_to_numa_node(page_id, _primary_buffer_pool->node_id);
+
+      // Required: page is now on DRAM (prevents wrong refunds / double refunds later)
+      frame->set_node_id(_primary_buffer_pool->node_id);
+
       increment_counter(_metrics->total_hits);
       increment_counter(_metrics->total_bytes_copied_from_numa_to_dram, page_id.num_bytes());
       return;
@@ -510,6 +593,17 @@ void* BufferManager::do_allocate(std::size_t bytes, std::size_t alignment) {
   auto region = _volatile_regions[static_cast<uint64_t>(size_type)];
   const auto [page_id, frame, ptr] = region->allocate();
 
+#ifndef NDEBUG
+  {
+    std::lock_guard<std::mutex> lock(s_live_pages_mutex);
+    const auto key = live_page_key(page_id);
+    if (!s_live_pages.insert(key).second) {
+      Fail("BufferManager::do_allocate handed out an already-live page_id=" +
+           std::string(magic_enum::enum_name(page_id.size_type())) + " idx=" + std::to_string(page_id.index));
+    }
+  }
+#endif
+
   increment_counter(_metrics->num_allocs);
   increment_counter(_metrics->total_allocated_bytes, bytes_for_size_type(size_type));
 
@@ -535,13 +629,22 @@ void* BufferManager::do_allocate(std::size_t bytes, std::size_t alignment) {
 
     region->mbind_to_numa_node(page_id, buffer_pool->node_id);
 
+    // Required: make accounting and deallocation consistent
+    frame->set_node_id(buffer_pool->node_id);
+
 #ifndef NDEBUG
-    _track_allocation(ptr, bytes, page_id);
+    bool in_extent_hooks_inner = false;
+#if defined(HYRISE_WITH_JEMALLOC)
+    in_extent_hooks_inner = jemalloc_extent_hooks_tls_flag();
+#endif
+    if (!in_extent_hooks_inner) {
+      _track_allocation(ptr, bytes, page_id);
+    }
 #endif
 
 #ifndef NDEBUG
-  volatile std::byte* probe = ptr;
-  probe[0] = std::byte{0xAB};
+    volatile std::byte* probe = ptr;
+    probe[0] = std::byte{0xAB};
 #endif
 
     frame->unlock_exclusive();
@@ -550,6 +653,7 @@ void* BufferManager::do_allocate(std::size_t bytes, std::size_t alignment) {
 
   frame->unlock_exclusive_and_set_evicted();
   region->deallocate(page_id);
+
   Fail("Could not allocate page on NUMA or DRAM. Try increasing buffer pool sizes.");
 }
 
@@ -568,6 +672,33 @@ void BufferManager::do_deallocate(void* p, std::size_t bytes, std::size_t alignm
     Fail("BufferManager::do_deallocate called with pointer not belonging to mapped region");
   }
 
+#ifndef NDEBUG
+{
+  std::lock_guard<std::mutex> lock(s_live_pages_mutex);
+  const auto key = live_page_key(page_id);
+
+  if (s_live_pages.erase(key) == 0) {
+    // If we're deallocating exactly the base of a BM page with the full page size,
+    // this can happen during reset/drain of deferred frees (jemalloc extent hooks)
+    // or after mapping-epoch changes. Treat as non-fatal in debug.
+    const auto expected_base = page_base_ptr(page_id);
+    const auto expected_size = bytes_for_size_type(page_id.size_type());
+
+    if (p == expected_base && bytes == expected_size) {
+      std::cerr << "[BM] WARNING: do_deallocate saw untracked page-base free (likely deferred/reset). "
+                << "page_id=" << page_id << " ptr=" << p << " bytes=" << bytes << "\n";
+    } else {
+      std::ostringstream oss;
+      oss << "BufferManager::do_deallocate detected double-free or invalid free for page_id="
+          << page_id
+          << " ptr=" << p
+          << " bytes_arg=" << bytes;
+      Fail(oss.str());
+    }
+  }
+}
+#endif
+
   auto region = get_region(page_id);
   auto frame = region->get_frame(page_id);
 
@@ -581,6 +712,14 @@ void BufferManager::do_deallocate(void* p, std::size_t bytes, std::size_t alignm
   }
 
   const auto num_bytes = bytes_for_size_type(page_id.size_type());
+
+  // pmr::memory_resource::deallocate() is called with the originally requested size, not necessarily the backing size.
+  // We allocate whole pages, so the deallocation size may be smaller than the page size.
+  DebugAssert(bytes <= num_bytes,
+              "do_deallocate size mismatch: arg bytes=" + std::to_string(bytes) +
+              " but page size=" + std::to_string(num_bytes) +
+              " size_type=" + std::string(magic_enum::enum_name(page_id.size_type())));
+
   if (frame->node_id() == _primary_buffer_pool->node_id) {
     _primary_buffer_pool->free_bytes(num_bytes);
   } else if (_secondary_buffer_pool && _secondary_buffer_pool->enabled &&
@@ -627,6 +766,18 @@ size_t BufferManager::memory_consumption() const {
 
 size_t BufferManager::pool_size() const {
   return _primary_buffer_pool->max_bytes + (_secondary_buffer_pool->enabled ? _secondary_buffer_pool->max_bytes : 0);
+}
+
+// TODO: Required?
+std::byte* BufferManager::page_base_ptr(const PageID page_id) const {
+  DebugAssert(page_id.valid(), "Invalid page id");
+  DebugAssert(_mapped_region != nullptr, "BufferManager mapping not initialized");
+
+  const auto region_idx = static_cast<size_t>(page_id.size_type()); // relies on enum order matching regions (as in find_page)
+  const auto page_size = bytes_for_size_type(page_id.size_type());
+
+  const auto region_base = _mapped_region + region_idx * DEFAULT_RESERVED_VIRTUAL_MEMORY_PER_REGION;
+  return region_base + static_cast<size_t>(page_id.index) * page_size;
 }
 
 }  // namespace hyrise

@@ -3,6 +3,18 @@
 #include "storage/buffer/ssd_region.hpp"
 #include "volatile_region.hpp"
 
+#ifndef NDEBUG
+#include <iostream>
+#include <sstream>
+#include <vector>
+#if __has_include(<execinfo.h>)
+#include <execinfo.h>
+#define HYRISE_HAS_EXECINFO 1
+#else
+#define HYRISE_HAS_EXECINFO 0
+#endif
+#endif
+
 namespace hyrise {
 //TODO: properly check if disabled or not
 BufferPool::BufferPool(const bool enabled, const size_t pool_size, const bool enable_eviction_purge_worker,
@@ -25,9 +37,36 @@ BufferPool::BufferPool(const bool enabled, const size_t pool_size, const bool en
                                                                        [&](size_t) { this->purge_eviction_queue(); })
                                 : nullptr) {}
 
+#ifndef NDEBUG
+static std::string debug_backtrace() {
+#if HYRISE_HAS_EXECINFO
+  std::vector<void*> addrs(64);
+  const auto n = ::backtrace(addrs.data(), static_cast<int>(addrs.size()));
+  if (n <= 0) {
+    return "(backtrace failed)";
+  }
+  addrs.resize(static_cast<size_t>(n));
+
+  char** syms = ::backtrace_symbols(addrs.data(), static_cast<int>(addrs.size()));
+  if (!syms) {
+    return "(backtrace_symbols failed)";
+  }
+
+  std::ostringstream oss;
+  for (size_t i = 0; i < addrs.size(); ++i) {
+    oss << "\n  " << syms[i];
+  }
+  std::free(syms);
+  return oss.str();
+#else
+  return "(no execinfo.h available)";
+#endif
+}
+#endif
+
 void BufferPool::purge_eviction_queue() {
   auto item = EvictionItem{};
-  for (auto i = size_t{0}; 0 < MAX_EVICTION_QUEUE_PURGES; ++i) {
+  for (auto i = size_t{0}; i < MAX_EVICTION_QUEUE_PURGES; ++i) {
     if (!eviction_queue->try_pop(item)) {
       return;
     }
@@ -52,25 +91,86 @@ void BufferPool::add_to_eviction_queue(const PageID page_id, Frame* frame) {
 }
 
 void BufferPool::free_bytes(const uint64_t bytes) {
-  used_bytes.fetch_sub(bytes);
+#ifndef NDEBUG
+  if (bytes == 0) {
+    return;
+  }
+
+  const auto before = used_bytes.load(std::memory_order_relaxed);
+  if (before < bytes) {
+    std::ostringstream oss;
+    oss << "BufferPool::free_bytes underflow: before=" << before
+        << " sub=" << bytes
+        << " max_bytes=" << max_bytes
+        << " node_id=" << node_id
+        << " enabled=" << enabled;
+
+    // Best-effort backtrace
+    std::vector<void*> addrs(64);
+    const auto n = ::backtrace(addrs.data(), static_cast<int>(addrs.size()));
+    if (n > 0) addrs.resize(static_cast<size_t>(n));
+    char** syms = ::backtrace_symbols(addrs.data(), static_cast<int>(addrs.size()));
+    if (syms) {
+      oss << "\nBacktrace:";
+      for (size_t i = 0; i < addrs.size(); ++i) {
+        oss << "\n  " << syms[i];
+      }
+      std::free(syms);
+    }
+
+    Fail(oss.str());
+  }
+#endif
+
+  used_bytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
 
 uint64_t BufferPool::reserve_bytes(const uint64_t bytes) {
-  return used_bytes.fetch_add(bytes);
+#ifndef NDEBUG
+  if (bytes == 0) {
+    return used_bytes.load(std::memory_order_relaxed);
+  }
+#endif
+
+  const auto before = used_bytes.fetch_add(bytes, std::memory_order_relaxed);
+
+#ifndef NDEBUG
+  const auto after = before + bytes;
+  if (after > max_bytes + (bytes_for_size_type(MAX_PAGE_SIZE_TYPE) * 4)) {
+    std::cerr << "[BM][DEBUG] reserve_bytes large oversubscription: before=" << before
+              << " add=" << bytes
+              << " after=" << after
+              << " max_bytes=" << max_bytes
+              << " node_id=" << node_id
+              << "\n";
+  }
+#endif
+
+  return before;
 }
 
 bool BufferPool::ensure_free_pages(const PageSizeType required_size) {
   // TODO: Free at least 64 * PageSite bytes to reduce TLB shootdowns
   const auto bytes_required = bytes_for_size_type(required_size);
   auto freed_bytes = size_t{0};
-  auto current_bytes = reserve_bytes(bytes_required);
+
+  reserve_bytes(bytes_required);
 
   auto item = EvictionItem{};
 
   // Find potential victim frame if we don't have enough space left
   // TODO: Verify, that this is correct, cceh kthe numbersm, verify value type
-  while ((current_bytes + bytes_required - freed_bytes) > max_bytes) {
+  while (used_bytes.load(std::memory_order_relaxed) > max_bytes) {
     if (!eviction_queue->try_pop(item)) {
+#ifndef NDEBUG
+      std::cerr << "[BM][DEBUG] ensure_free_pages failed: eviction_queue empty"
+                << " required_bytes=" << bytes_required
+                << " used_bytes=" << used_bytes.load(std::memory_order_relaxed)
+                << " max_bytes=" << max_bytes
+                << " freed_bytes=" << freed_bytes
+                << " node_id=" << node_id
+                << "\n";
+#endif
       free_bytes(bytes_required);  // TODO: Check if this is correct
       return false;
     }
@@ -114,7 +214,6 @@ bool BufferPool::ensure_free_pages(const PageSizeType required_size) {
 
     const auto size_type = item.page_id.size_type();
     freed_bytes += bytes_for_size_type(size_type);
-    current_bytes = used_bytes.load();
   }
 
   // TODO: Check if this is correct
@@ -156,6 +255,9 @@ void BufferPool::evict(EvictionItem& item, Frame* frame) {
         continue;
       };
       region->mbind_to_numa_node(item.page_id, target_buffer_pool->node_id);
+
+      frame->set_node_id(target_buffer_pool->node_id);
+
       frame->unlock_exclusive();
       target_buffer_pool->add_to_eviction_queue(item.page_id, frame);
       //   TODO:increment_counter(metrics.total_bytes_copied_from_dram_to_numa, num_bytes);

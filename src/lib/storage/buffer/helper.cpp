@@ -27,22 +27,36 @@ boost::container::pmr::memory_resource* get_buffer_manager_memory_resource() {
 //----------------------------------------------------
 
 std::byte* create_mapped_region() {
-  Assert(bytes_for_size_type(MIN_PAGE_SIZE_TYPE) >= get_os_page_size(),
-         "Smallest page size does not fit into an OS page: " + std::to_string(get_os_page_size()));
+  const auto align = bytes_for_size_type(MAX_PAGE_SIZE_TYPE); // TODO: Correct?
+  const auto total = DEFAULT_RESERVED_VIRTUAL_MEMORY + align;
+
 #ifdef __APPLE__
   const int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
 #elif __linux__
   const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
 #endif
-  const auto mapped_memory =
-      static_cast<std::byte*>(mmap(NULL, DEFAULT_RESERVED_VIRTUAL_MEMORY, PROT_READ | PROT_WRITE, flags, -1, 0));
 
-  if (mapped_memory == MAP_FAILED) {
-    const auto error = errno;
-    Fail("Failed to map volatile pool region: " + strerror(error));
+  auto raw = static_cast<std::byte*>(mmap(nullptr, total, PROT_READ | PROT_WRITE, flags, -1, 0));
+  if (raw == MAP_FAILED) {
+    Fail("Failed to map volatile pool region: " + std::string(strerror(errno)));
   }
 
-  return mapped_memory;
+  // TODO: Check again
+  auto raw_u = reinterpret_cast<std::uintptr_t>(raw);
+  auto aligned_u = (raw_u + (align - 1)) & ~(align - 1);
+  auto aligned = reinterpret_cast<std::byte*>(aligned_u);
+
+  const auto prefix = aligned - raw;
+  const auto suffix = (raw + total) - (aligned + DEFAULT_RESERVED_VIRTUAL_MEMORY);
+
+  if (prefix > 0) {
+    munmap(raw, prefix);
+  }
+  if (suffix > 0) {
+    munmap(aligned + DEFAULT_RESERVED_VIRTUAL_MEMORY, suffix);
+  }
+
+  return aligned;
 }
 
 std::array<std::shared_ptr<VolatileRegion>, NUM_PAGE_SIZE_TYPES> create_volatile_regions(

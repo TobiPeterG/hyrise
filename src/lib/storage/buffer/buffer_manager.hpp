@@ -91,11 +91,12 @@ class BufferManager : public boost::container::pmr::memory_resource, public Nonc
   size_t free_bytes_numa_node() const;
   size_t total_bytes_dram_node() const;
   size_t total_bytes_numa_node() const;
+  // TODO: Required?
+  std::byte* page_base_ptr(const PageID page_id) const;
 
   // Debugging methods
   Frame::StateVersionType _state(const PageID page_id);
   std::byte* _get_page_ptr(const PageID page_id);
-
  protected:
   friend class Hyrise;
 

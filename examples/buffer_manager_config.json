@@ -1,6 +1,6 @@
 {
-  "dram_buffer_pool_size": 268435456,
-  "numa_buffer_pool_size": 268435456,
+  "dram_buffer_pool_size": 1073741824,
+  "numa_buffer_pool_size": 1073741824,
   "ssd_path": "/tmp/hyrise_ssd",
 
   "migration_policy": {

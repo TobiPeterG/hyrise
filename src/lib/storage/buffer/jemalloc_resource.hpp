@@ -14,6 +14,10 @@ class JemallocMemoryResource : public boost::container::pmr::memory_resource, pu
   void* do_allocate(std::size_t bytes, std::size_t alignment);
   void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment);
   bool do_is_equal(const boost::container::pmr::memory_resource& other) const noexcept;
+// TODO: Required?
+#ifdef HYRISE_WITH_JEMALLOC
+  void drain_deferred_bm_frees();
+#endif
 
   void reset();
 
