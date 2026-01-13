@@ -2,8 +2,10 @@
 
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -14,6 +16,7 @@
 #include "base_test.hpp"
 
 #include "SQLParser.h"
+#include "magic_enum.hpp"
 
 #include "concurrency/transaction_context.hpp"
 #include "hyrise.hpp"
@@ -38,8 +41,6 @@ class SQLiteTestRunner : public BaseTestWithParam<SQLiteTestRunnerParam> {
  public:
   static constexpr auto CHUNK_SIZE = ChunkOffset{10};
 
-  // Structure to cache initially loaded tables and store their file paths
-  // to reload the the table from the given tbl file whenever required.
   struct TableCacheEntry {
     std::shared_ptr<Table> table;
     std::string filename;
@@ -49,22 +50,21 @@ class SQLiteTestRunner : public BaseTestWithParam<SQLiteTestRunnerParam> {
 
   using TableCache = std::map<std::string, TableCacheEntry>;
 
-  static void SetUpTestCase();
-
   void SetUp() override;
+  void TearDown() override;
 
   // Returns pair of the line in the sql file and the query itself
   static std::vector<std::pair<size_t, std::string>> queries();
 
  protected:
-  inline static std::unique_ptr<SQLiteWrapper> _sqlite;
-  inline static std::map<EncodingType, TableCache> _table_cache_per_encoding;
-  inline static std::string _master_table_suffix = "_master_copy";
+  std::unique_ptr<SQLiteWrapper> _sqlite;
+  std::map<EncodingType, TableCache> _table_cache_per_encoding;
+  std::string _master_table_suffix = "_master_copy";
 
-  inline static std::shared_ptr<SQLLogicalPlanCache> _lqp_cache;
-  inline static std::shared_ptr<SQLPhysicalPlanCache> _pqp_cache;
+  std::shared_ptr<SQLLogicalPlanCache> _lqp_cache;
+  std::shared_ptr<SQLPhysicalPlanCache> _pqp_cache;
 
-  inline static bool _last_run_successful{true};
+  bool _last_run_successful{true};
 };
 
 inline auto sqlite_testrunner_formatter = [](const ::testing::TestParamInfo<SQLiteTestRunnerParam>& info) {

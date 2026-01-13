@@ -20,7 +20,12 @@ namespace hyrise {
 
 class OperatorsJoinIndexTest : public BaseTest {
  public:
-  static void SetUpTestCase() {  // called ONCE before the tests
+  static void SetUpTestCase() {}
+  static void TearDownTestCase() {}
+
+  void SetUp() override {
+    BaseTest::SetUp();
+
     const auto dummy_table =
         std::make_shared<Table>(TableColumnDefinitions{{"a", DataType::Int, false}}, TableType::Data);
     dummy_input = std::make_shared<TableWrapper>(dummy_table);
@@ -41,6 +46,7 @@ class OperatorsJoinIndexTest : public BaseTest {
         std::make_shared<TableWrapper>(load_table("resources/test_data/tbl/int_float_null_2.tbl", ChunkOffset{20}));
 
     // Disable auto-clearing of operators' output
+    dummy_input->never_clear_output();
     _table_wrapper_a->never_clear_output();
     _table_wrapper_b->never_clear_output();
     _table_wrapper_c->never_clear_output();
@@ -64,6 +70,23 @@ class OperatorsJoinIndexTest : public BaseTest {
     _table_wrapper_h_no_index->execute();
     _table_wrapper_i->execute();
     _table_wrapper_i_no_index->execute();
+  }
+
+  void TearDown() override {
+    _table_wrapper_i_no_index.reset();
+    _table_wrapper_i.reset();
+    _table_wrapper_h_no_index.reset();
+    _table_wrapper_h.reset();
+    _table_wrapper_g.reset();
+    _table_wrapper_f.reset();
+    _table_wrapper_e.reset();
+    _table_wrapper_d.reset();
+    _table_wrapper_c.reset();
+    _table_wrapper_b.reset();
+    _table_wrapper_a.reset();
+    dummy_input.reset();
+
+    BaseTest::TearDown();
   }
 
  protected:
@@ -130,8 +153,10 @@ class OperatorsJoinIndexTest : public BaseTest {
     }
   }
 
-  inline static std::shared_ptr<TableWrapper> dummy_input, _table_wrapper_a, _table_wrapper_b, _table_wrapper_c,
-      _table_wrapper_d, _table_wrapper_e, _table_wrapper_f, _table_wrapper_g, _table_wrapper_h, _table_wrapper_i,
+  std::shared_ptr<TableWrapper> dummy_input;
+
+  std::shared_ptr<TableWrapper> _table_wrapper_a, _table_wrapper_b, _table_wrapper_c, _table_wrapper_d,
+      _table_wrapper_e, _table_wrapper_f, _table_wrapper_g, _table_wrapper_h, _table_wrapper_i,
       _table_wrapper_h_no_index, _table_wrapper_i_no_index;
 };
 

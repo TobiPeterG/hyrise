@@ -22,7 +22,12 @@ namespace hyrise {
 
 class SQLPipelineTest : public BaseTest {
  protected:
-  static void SetUpTestCase() {  // called ONCE before the tests
+  static void SetUpTestCase() {}
+  static void TearDownTestCase() {}
+
+  void SetUp() override {
+    BaseTest::SetUp();
+
     _table_a_multi = load_table("resources/test_data/tbl/int_float.tbl", ChunkOffset{2});
     _table_a_multi->append({11, 11.11f});
     _table_b = load_table("resources/test_data/tbl/int_float2.tbl", ChunkOffset{2});
@@ -34,9 +39,7 @@ class SQLPipelineTest : public BaseTest {
     _join_result = std::make_shared<Table>(column_definitions, TableType::Data);
     _join_result->append({12345, 458.7f, 456.7f});
     _join_result->append({12345, 458.7f, 457.7f});
-  }
 
-  void SetUp() override {
     // We reload table_a every time since it is modified during the test case.
     _table_a = load_table("resources/test_data/tbl/int_float.tbl", ChunkOffset{2});
     Hyrise::get().storage_manager.add_table("table_a", _table_a);
@@ -47,13 +50,34 @@ class SQLPipelineTest : public BaseTest {
     _pqp_cache = std::make_shared<SQLPhysicalPlanCache>();
   }
 
+  void TearDown() override {
+    if (Hyrise::get().storage_manager.has_table("table_a")) {
+      Hyrise::get().storage_manager.drop_table("table_a");
+    }
+    if (Hyrise::get().storage_manager.has_table("table_a_multi")) {
+      Hyrise::get().storage_manager.drop_table("table_a_multi");
+    }
+    if (Hyrise::get().storage_manager.has_table("table_b")) {
+      Hyrise::get().storage_manager.drop_table("table_b");
+    }
+
+    _pqp_cache.reset();
+
+    _table_a.reset();
+    _table_a_multi.reset();
+    _table_b.reset();
+    _join_result.reset();
+
+    BaseTest::TearDown();
+  }
+
   // Tables modified during test case
   std::shared_ptr<Table> _table_a;
 
   // Tables not modified during test case
-  inline static std::shared_ptr<Table> _table_a_multi;
-  inline static std::shared_ptr<Table> _table_b;
-  inline static std::shared_ptr<Table> _join_result;
+  std::shared_ptr<Table> _table_a_multi;
+  std::shared_ptr<Table> _table_b;
+  std::shared_ptr<Table> _join_result;
 
   std::shared_ptr<SQLPhysicalPlanCache> _pqp_cache;
 

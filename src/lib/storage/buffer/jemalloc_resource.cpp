@@ -4,9 +4,145 @@
 #endif
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include "hyrise.hpp"
 #include "utils/assert.hpp"
+
+#ifndef NDEBUG
+#include <dlfcn.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <array>
+#include <execinfo.h>
+#include <cinttypes>
+#include <iostream>
+#include <mutex>
+#endif
+
+namespace hyrise {
+
+#ifdef HYRISE_WITH_JEMALLOC
+
+#ifndef NDEBUG
+namespace {
+
+struct LiveAllocRec {
+  void* ptr{nullptr};
+  size_t bytes{0};
+  size_t align{0};
+  int tid{0};
+
+  static constexpr int kMaxFrames = 16;
+  int nframes{0};
+  void* pcs[kMaxFrames]{};
+};
+
+constexpr size_t kLiveCap = 1u << 18;
+std::array<LiveAllocRec, kLiveCap> g_live{};
+size_t g_live_count = 0;
+std::mutex g_live_mtx;
+
+static inline size_t _hash_ptr(void* p) {
+  auto x = static_cast<uintptr_t>(reinterpret_cast<uintptr_t>(p));
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33;
+  x *= 0xc4ceb9fe1a85ec53ULL;
+  x ^= x >> 33;
+  return static_cast<size_t>(x) & (kLiveCap - 1);
+}
+
+static inline void _track_alloc(const LiveAllocRec& rec) {
+  if (!rec.ptr) return;
+
+  std::lock_guard<std::mutex> lk(g_live_mtx);
+  size_t i = _hash_ptr(rec.ptr);
+
+  for (size_t probe = 0; probe < kLiveCap; ++probe) {
+    auto& s = g_live[i];
+
+    if (s.ptr == nullptr) {
+      s = rec;
+      ++g_live_count;
+      return;
+    }
+
+    if (s.ptr == rec.ptr) {
+      s = rec;
+      return;
+    }
+
+    i = (i + 1) & (kLiveCap - 1);
+  }
+
+  std::cerr << "[JEMALLOC][TRACK] live table full; cannot track " << rec.ptr << "\n";
+}
+
+static inline void _track_free(void* p) {
+  if (!p) return;
+
+  std::lock_guard<std::mutex> lk(g_live_mtx);
+  size_t i = _hash_ptr(p);
+
+  for (size_t probe = 0; probe < kLiveCap; ++probe) {
+    auto& s = g_live[i];
+
+    if (s.ptr == nullptr) {
+      return;
+    }
+
+    if (s.ptr == p) {
+      s = LiveAllocRec{};
+      if (g_live_count) --g_live_count;
+      return;
+    }
+
+    i = (i + 1) & (kLiveCap - 1);
+  }
+}
+
+static inline void _dump_live(size_t limit) {
+  std::lock_guard<std::mutex> lk(g_live_mtx);
+  std::cerr << "[JEMALLOC][TRACK] live_count=" << g_live_count << "\n";
+  size_t shown = 0;
+
+  for (const auto& s : g_live) {
+    if (!s.ptr) continue;
+
+    std::cerr << "  live ptr=" << s.ptr
+              << " bytes=" << s.bytes
+              << " align=" << s.align
+              << " tid=" << s.tid
+              << "\n";
+
+    for (int i = 0; i < s.nframes; ++i) {
+      Dl_info info{};
+      const auto pc = s.pcs[i];
+      if (dladdr(pc, &info) && info.dli_sname) {
+        std::cerr << "    #" << i << " " << info.dli_sname
+                  << " (" << (info.dli_fname ? info.dli_fname : "?") << ")"
+                  << " pc=" << pc << "\n";
+      } else {
+        std::cerr << "    #" << i << " pc=" << pc << "\n";
+      }
+    }
+
+    if (++shown >= limit) break;
+  }
+}
+
+}  // namespace
+
+extern "C" void hyrise_jemalloc_dump_live_allocs(size_t limit) {
+  _dump_live(limit);
+}
+#endif  // !NDEBUG
+
+
+#endif  // HYRISE_WITH_JEMALLOC
+
+}  // namespace hyrise
 
 #ifdef HYRISE_WITH_JEMALLOC
 
@@ -21,7 +157,6 @@
 
 namespace {
 // TODO: Mostly likely not needed
-// from jemalloc internals (see arena_types.h)
 struct arena_config_s {
   /* extent hooks to be used for the arena */
   extent_hooks_t* extent_hooks;
@@ -36,7 +171,7 @@ using arena_config_t = struct arena_config_s;
 
 namespace hyrise {
 
-  // TODO: Required?
+// TODO: Required?
 #ifdef HYRISE_WITH_JEMALLOC
 bool& jemalloc_extent_hooks_tls_flag() {
   static thread_local bool v = false;
@@ -46,23 +181,22 @@ bool& jemalloc_extent_hooks_tls_flag() {
 
 #ifdef HYRISE_WITH_JEMALLOC
 
-
 // TODO: Required?
 
 struct ExtentRec {
-  size_t size;          // current extent size (changes on split/merge)
+  size_t size;  // current extent size (changes on split/merge)
   size_t alignment;
   unsigned arena_index;
 
-  void* page_base;      // BufferManager page base this extent belongs to
-  size_t page_size;     // BufferManager page size in bytes
+  void* page_base;   // BufferManager page base this extent belongs to
+  size_t page_size;  // BufferManager page size in bytes
 
-  bool live = true;     // IMPORTANT: never erase in hooks; mark dead instead
+  bool live = true;  // IMPORTANT: never erase in hooks; mark dead instead
 };
 
 static std::mutex s_extents_mutex;
-static std::unordered_map<void*, ExtentRec> s_extents;          // extent addr -> metadata
-static std::unordered_map<void*, size_t> s_page_live_extents;   // page_base -> number of live extents on this BM page
+static std::unordered_map<void*, ExtentRec> s_extents;         // extent addr -> metadata
+static std::unordered_map<void*, size_t> s_page_live_extents;  // page_base -> number of live extents on this BM page
 constexpr size_t kPendingFreeCap = 1u << 16;
 
 // TODO: Required?
@@ -90,7 +224,8 @@ struct PendingFreeQueue {
 
   bool pop(void*& base_out, size_t& size_out) {
     const auto h = head.load(std::memory_order_relaxed);
-    if (h == tail.load(std::memory_order_acquire)) return false;
+    if (h == tail.load(std::memory_order_acquire))
+      return false;
     base_out = items[h].base;
     size_out = items[h].size;
     head.store((h + 1) % kPendingFreeCap, std::memory_order_release);
@@ -106,7 +241,8 @@ static void drain_deferred_bm_frees() {
   size_t page_size = 0;
 
   while (s_pending_page_frees.pop(page_base, page_size)) {
-    if (!page_base || page_size == 0) continue;
+    if (!page_base || page_size == 0)
+      continue;
 
     // Validate against the CURRENT BufferManager mapping. The pending queue is global and can contain
     // stale pointers from previous mappings / resets. Never call BM::deallocate on those.
@@ -130,13 +266,9 @@ static void drain_deferred_bm_frees() {
 #ifndef NDEBUG
 static void debug_extent_msg(const char* what, void* addr, size_t hook_size, const ExtentRec* rec) {
   std::ostringstream oss;
-  oss << "[BM][JEMALLOC] " << what
-      << " addr=" << addr
-      << " hook_size=" << hook_size;
+  oss << "[BM][JEMALLOC] " << what << " addr=" << addr << " hook_size=" << hook_size;
   if (rec) {
-    oss << " tracked_size=" << rec->size
-        << " tracked_align=" << rec->alignment
-        << " arena=" << rec->arena_index;
+    oss << " tracked_size=" << rec->size << " tracked_align=" << rec->alignment << " arena=" << rec->arena_index;
   }
   oss << "\n";
   std::cerr << oss.str();
@@ -146,7 +278,8 @@ static void debug_extent_msg(const char* what, void* addr, size_t hook_size, con
 static bool find_extent_rec(void* addr, ExtentRec& rec_out) {
   std::lock_guard<std::mutex> lock(s_extents_mutex);
   const auto it = s_extents.find(addr);
-  if (it == s_extents.end()) return false;
+  if (it == s_extents.end())
+    return false;
   rec_out = it->second;
   return true;
 }
@@ -165,11 +298,13 @@ static bool _addr_in_buffer_manager_mapping(void* addr) {
 
 // TODO: Required?
 static bool _page_info_for_addr(void* addr, void*& page_base_out, size_t& page_size_out) {
-  if (!addr) return false;
+  if (!addr)
+    return false;
 
   const auto& bm = Hyrise::get().buffer_manager;
   const auto page_id = bm.find_page(addr);
-  if (!page_id.valid()) return false;
+  if (!page_id.valid())
+    return false;
 
   page_base_out = bm.page_base_ptr(page_id);
   page_size_out = bytes_for_size_type(page_id.size_type());
@@ -196,12 +331,14 @@ static void _track_new_extent_unlocked(void* extent_addr, size_t extent_size, si
 // TODO: Required?
 static bool _untrack_extent_and_maybe_free_page_unlocked(void* extent_addr) {
   const auto it = s_extents.find(extent_addr);
-  if (it == s_extents.end()) return false;
+  if (it == s_extents.end())
+    return false;
 
   auto& rec = it->second;
 
   // Never free nodes inside jemalloc hooks.
-  if (!rec.live) return false;
+  if (!rec.live)
+    return false;
   rec.live = false;
 
   auto pit = s_page_live_extents.find(rec.page_base);
@@ -245,26 +382,41 @@ static extent_hooks_t* _get_fallback_hooks() {
   return s_fallback_hooks;
 }
 
-// TODO: Check again
-static void* extent_alloc(extent_hooks_t* /*extent_hooks*/, void* new_addr, size_t size, size_t alignment, bool* zero,
-                          bool* commit, unsigned arena_index) {
-  if (size > bytes_for_size_type(MAX_PAGE_SIZE_TYPE)) {
-    auto* fallback = _get_fallback_hooks();
-    return fallback->alloc ? fallback->alloc(fallback, new_addr, size, alignment, zero, commit, arena_index) : nullptr;
+#ifdef HYRISE_WITH_JEMALLOC
+std::atomic<uint64_t> _outstanding{0};
+#endif
+
+static void* extent_alloc(extent_hooks_t*, void* new_addr, size_t size, size_t alignment, bool* zero, bool* commit,
+                          unsigned arena_index) {
+  if (new_addr != nullptr) {
+    // We cannot guarantee allocation at an exact address -> refuse.
+    return nullptr;
   }
 
-  if (commit) *commit = true;
-  if (zero) *zero = false;
+  const bool need_zero = (zero && *zero);
 
-  // Mark this allocation as coming from jemalloc's extent hooks so BufferManager debug tracking
-  // does not treat it like a user allocation (avoids false "leak" reports on shutdown/reset).
+  if (commit)
+    *commit = true;
+
   struct ExtentHookGuard {
-    ExtentHookGuard() { jemalloc_extent_hooks_tls_flag() = true; }
-    ~ExtentHookGuard() { jemalloc_extent_hooks_tls_flag() = false; }
+    ExtentHookGuard() {
+      jemalloc_extent_hooks_tls_flag() = true;
+    }
+
+    ~ExtentHookGuard() {
+      jemalloc_extent_hooks_tls_flag() = false;
+    }
   } guard;
 
-  auto* ptr = Hyrise::get().buffer_manager.allocate(size, alignment);
-  if (!ptr) return nullptr;
+  void* ptr = Hyrise::get().buffer_manager.allocate(size, alignment);
+  if (!ptr)
+    return nullptr;
+
+  if (need_zero) {
+    std::memset(ptr, 0, size);
+  }
+  if (zero)
+    *zero = need_zero;
 
   {
     std::lock_guard<std::mutex> lock(s_extents_mutex);
@@ -299,12 +451,14 @@ bool extent_dalloc(extent_hooks_t* /*extent_hooks*/, void* addr, size_t size, bo
   }
 
   auto* fallback = _get_fallback_hooks();
-  if (fallback->dalloc) return fallback->dalloc(fallback, addr, size, committed, arena_ind);
+  if (fallback->dalloc)
+    return fallback->dalloc(fallback, addr, size, committed, arena_ind);
   return true;
 }
 
 // TODO: Check again
-static void extent_destroy(extent_hooks_t* /*extent_hooks*/, void* addr, size_t size, bool committed, unsigned arena_ind) {
+static void extent_destroy(extent_hooks_t* /*extent_hooks*/, void* addr, size_t size, bool committed,
+                           unsigned arena_ind) {
 #ifndef NDEBUG
   debug_extent_msg("extent_destroy(raw)", addr, size, nullptr);
 #endif
@@ -324,7 +478,8 @@ static void extent_destroy(extent_hooks_t* /*extent_hooks*/, void* addr, size_t 
   }
 
   auto* fallback = _get_fallback_hooks();
-  if (fallback->destroy) fallback->destroy(fallback, addr, size, committed, arena_ind);
+  if (fallback->destroy)
+    fallback->destroy(fallback, addr, size, committed, arena_ind);
 }
 
 // TODO: Check again
@@ -523,22 +678,18 @@ void JemallocMemoryResource::create_arena() {
 // TODO: Check again
 void JemallocMemoryResource::reset() {
 #ifdef HYRISE_WITH_JEMALLOC
-  // Drain deferred BM frees while we're NOT inside jemalloc extent hooks.
   drain_deferred_bm_frees();
-
-  // Flush per-thread tcache (even though TCACHE_NONE is set, this is harmless and helps if configs change)
   Assert(mallctl("thread.tcache.flush", nullptr, nullptr, nullptr, 0) == 0, "tcache.flush failed");
 
-  // Detach *current* thread from this arena (best-effort; other threads may still be attached)
-  {
-    unsigned zero = 0;
-    (void)mallctl("thread.arena", nullptr, nullptr, &zero, sizeof(zero));
-  }
-
-  // Ask jemalloc to purge unused pages for this arena (best-effort)
-  {
-    const std::string purge_cmd = "arena." + std::to_string(_arena_index) + ".purge";
-    (void)mallctl(purge_cmd.c_str(), nullptr, nullptr, nullptr, 0);
+  const std::string purge_cmd = "arena." + std::to_string(_arena_index) + ".purge";
+  (void)mallctl(purge_cmd.c_str(), nullptr, nullptr, nullptr, 0);
+  const auto n = _outstanding.load(std::memory_order_relaxed);
+  if (n != 0) {
+#ifndef NDEBUG
+    std::cerr << "[JEMALLOC][RESET] outstanding=" << n << "\n";
+    _dump_live(50);
+#endif
+    Fail("src/lib/storage/buffer/jemalloc_resource.cpp:547 reset() called with outstanding allocations");
   }
 
   // Try to destroy the arena to drop metadata + cached extents
@@ -555,20 +706,55 @@ void JemallocMemoryResource::reset() {
 
 void* JemallocMemoryResource::do_allocate(std::size_t bytes, std::size_t alignment) {
 #ifdef HYRISE_WITH_JEMALLOC
-  if (auto ptr = mallocx(bytes, MALLOCX_ALIGN(alignment) | _mallocx_flags)) {
-    return ptr;
+  void* p = mallocx(bytes, MALLOCX_ALIGN(alignment) | _mallocx_flags);
+  Assert(p, "Failed to allocate memory (" + std::to_string(bytes) + ")");
+
+#ifndef NDEBUG
+  {
+    // Capture a small stack without heap allocations
+    void* tmp[LiveAllocRec::kMaxFrames + 8]{};
+    const int n = ::backtrace(tmp, static_cast<int>(LiveAllocRec::kMaxFrames + 8));
+
+    // Heuristic skip:
+    // 0: backtrace
+    // 1: JemallocMemoryResource::do_allocate
+    // 2: boost::container::pmr::memory_resource::allocate (often)
+    int start = 2;
+    if (n > 3) start = 3;
+
+    LiveAllocRec rec;
+    rec.ptr = p;
+    rec.bytes = bytes;
+    rec.align = alignment;
+    rec.tid = static_cast<int>(::syscall(SYS_gettid));
+    rec.nframes = 0;
+
+    for (int i = start; i < n && rec.nframes < LiveAllocRec::kMaxFrames; ++i) {
+      rec.pcs[rec.nframes++] = tmp[i];
+    }
+
+    _track_alloc(rec);
   }
-  Fail("Failed to allocate memory (" + std::to_string(bytes) + ")");
+#endif
+
+  _outstanding.fetch_add(1, std::memory_order_relaxed);
+  return p;
 #else
-  Fail("Jeamlloc is not supported");
+  Fail("Jemalloc is not supported");
 #endif
 }
 
-void JemallocMemoryResource::do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) {
+void JemallocMemoryResource::do_deallocate(void* p, std::size_t, std::size_t) {
 #ifdef HYRISE_WITH_JEMALLOC
-  sdallocx(pointer, bytes, MALLOCX_ALIGN(alignment) | _mallocx_flags);
+  if (!p)
+    return;
+#ifndef NDEBUG
+  _track_free(p);
+#endif
+  dallocx(p, MALLOCX_TCACHE_NONE);
+  _outstanding.fetch_sub(1, std::memory_order_relaxed);
 #else
-  Fail("Jeamlloc is not supported");
+  Fail("Jemalloc is not supported");
 #endif
 }
 

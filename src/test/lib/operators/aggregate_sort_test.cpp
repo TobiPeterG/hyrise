@@ -99,7 +99,7 @@ class AggregateSortTest : public BaseTest {
   }
 
  protected:
-  inline static std::shared_ptr<TableWrapper> _table_wrapper_1, _table_wrapper_multi_columns;
+  std::shared_ptr<TableWrapper> _table_wrapper_1, _table_wrapper_multi_columns;
 };
 
 TEST_F(AggregateSortTest, SingleAggregateMaxSorted) {

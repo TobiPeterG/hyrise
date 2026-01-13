@@ -1,6 +1,10 @@
 #include "hyrise.hpp"
 #include "storage/buffer/jemalloc_resource.hpp"
 
+#ifndef NDEBUG
+#include <iostream>
+#endif
+
 namespace hyrise {
 
 Hyrise::Hyrise() {
@@ -26,63 +30,45 @@ Hyrise::Hyrise() {
   _scheduler = std::make_shared<ImmediateExecutionScheduler>();
 }
 
-Hyrise& Hyrise::operator=(Hyrise&& other) noexcept {
-  if (this == &other) {
-    return *this;
+// TODO: Is this really required?
+void Hyrise::reset() {
+  auto& h = Hyrise::get();
+
+#ifndef NDEBUG
+  std::cerr << "[RESET] before: BM base=" << static_cast<void*>(h.buffer_manager.debug_mapped_region_base()) << "\n";
+#endif
+
+  if (h._scheduler) {
+    h._scheduler->finish();
   }
+  h._scheduler.reset();
 
-  // Stop work first so nothing touches state while we dismantle it.
-  if (_scheduler) {
-    _scheduler->finish();
-  }
+  h.default_pqp_cache.reset();
+  h.default_lqp_cache.reset();
+  h.benchmark_runner.reset();
 
-  // Destroy subsystems that might access tables during destruction.
-  // (Assigning from moved-from objects can keep them in valid states, but we want to
-  // deterministically destroy current state in the right order.)
-  plugin_manager = PluginManager{};
+  h.plugin_manager = PluginManager{};
+  h.storage_manager = StorageManager{};
 
-  // Destroy tables before the BufferManager mapping can change.
-  storage_manager = StorageManager{};
+  h.transaction_manager = TransactionManager{};
+  h.meta_table_manager = MetaTableManager{};
+  h.settings_manager = SettingsManager{};
+  h.log_manager = LogManager{};
+  h.topology = Topology{};
 
-  // Clear thread-local allocation caches that might still point into the old BufferManager mapping.
-  // TODO: Is this really required?
   LinearBufferResource::get().reset();
 
 #ifdef HYRISE_WITH_JEMALLOC
-  // Now that tables/segments are gone, it is safe to reset jemalloc's arena state.
-  // Do this before the BufferManager mapping is replaced, so cached extents cannot
-  // keep referencing the old mapping.
   JemallocMemoryResource::get().reset();
 #endif
 
-  // Replace the remaining state
-  buffer_manager = std::move(other.buffer_manager);
-  storage_manager = std::move(other.storage_manager);
-  plugin_manager = std::move(other.plugin_manager);
+  h.buffer_manager = BufferManager{};
 
-  transaction_manager = std::move(other.transaction_manager);
-  meta_table_manager = std::move(other.meta_table_manager);
-  settings_manager = std::move(other.settings_manager);
-  log_manager = std::move(other.log_manager);
-  topology = std::move(other.topology);
+  h._scheduler = std::make_shared<ImmediateExecutionScheduler>();
+  h._scheduler->begin();
 
-  default_pqp_cache = std::move(other.default_pqp_cache);
-  default_lqp_cache = std::move(other.default_lqp_cache);
-  benchmark_runner = std::move(other.benchmark_runner);
-
-  _scheduler = std::move(other._scheduler);
-  return *this;
-}
-
-void Hyrise::reset() {
 #ifndef NDEBUG
-  std::cerr << "[RESET] before: BM base=" << static_cast<void*>(Hyrise::get().buffer_manager.debug_mapped_region_base()) << "\n";
-#endif
-  Hyrise::get().scheduler()->finish();
-
-  get() = Hyrise{};
-#ifndef NDEBUG
-  std::cerr << "[RESET] after : BM base=" << static_cast<void*>(Hyrise::get().buffer_manager.debug_mapped_region_base()) << "\n";
+  std::cerr << "[RESET] after : BM base=" << static_cast<void*>(h.buffer_manager.debug_mapped_region_base()) << "\n";
 #endif
 }
 
@@ -95,9 +81,13 @@ bool Hyrise::is_multi_threaded() const {
 }
 
 void Hyrise::set_scheduler(const std::shared_ptr<AbstractScheduler>& new_scheduler) {
-  _scheduler->finish();
+  if (_scheduler) {
+    _scheduler->finish();
+  }
   _scheduler = new_scheduler;
-  _scheduler->begin();
+  if (_scheduler) {
+    _scheduler->begin();
+  }
 }
 
 }  // namespace hyrise

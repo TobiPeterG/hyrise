@@ -21,12 +21,13 @@ inline std::size_t get_os_page_size() {
   return std::size_t(sysconf(_SC_PAGESIZE));
 }
 
+// TODO: Which sizes are useful?
 #ifdef __APPLE__
 constexpr size_t OS_PAGE_SIZE = 16384;
-enum class PageSizeType { KiB16, KiB32, KiB64, KiB128, KiB256, KiB512, MiB1, MiB2 };
+enum class PageSizeType { KiB16, KiB32, KiB64, KiB128, KiB256, KiB512, MiB1, MiB2, MiB4, MiB8 };
 #elif __linux__
 constexpr size_t OS_PAGE_SIZE = 4096;
-enum class PageSizeType { KiB4, KiB8, KiB16, KiB32, KiB64, KiB128, KiB256, KiB512, MiB1, MiB2 };
+enum class PageSizeType { KiB4, KiB8, KiB16, KiB32, KiB64, KiB128, KiB256, KiB512, MiB1, MiB2, MiB4, MiB8 };
 #endif
 
 // Get the number of bytes for a given PageSizeType

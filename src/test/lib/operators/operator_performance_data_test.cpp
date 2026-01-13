@@ -21,15 +21,27 @@ using namespace expression_functional;  // NOLINT(build/namespaces)
 
 class OperatorPerformanceDataTest : public BaseTest {
  protected:
-  static void SetUpTestCase() {
+  static void SetUpTestCase() {}
+  static void TearDownTestCase() {}
+
+  void SetUp() override {
+    BaseTest::SetUp();
+
     _table = load_table("resources/test_data/tbl/int_int.tbl", ChunkOffset{2});
     _table_wrapper = std::make_shared<TableWrapper>(_table);
     _table_wrapper->never_clear_output();
     _table_wrapper->execute();
   }
 
-  inline static std::shared_ptr<Table> _table;
-  inline static std::shared_ptr<TableWrapper> _table_wrapper;
+  void TearDown() override {
+    _table_wrapper.reset();
+    _table.reset();
+
+    BaseTest::TearDown();
+  }
+
+  std::shared_ptr<Table> _table;
+  std::shared_ptr<TableWrapper> _table_wrapper;
 };
 
 TEST_F(OperatorPerformanceDataTest, ElementsAreSet) {

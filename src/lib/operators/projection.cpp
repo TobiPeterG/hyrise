@@ -297,8 +297,18 @@ std::shared_ptr<const Table> Projection::_on_execute() {
 
 // returns the singleton dummy table used for literal projections
 std::shared_ptr<Table> Projection::dummy_table() {
-  static auto shared_dummy = std::make_shared<DummyTable>();
-  return shared_dummy;
+  static std::mutex mtx;
+  static std::weak_ptr<Table> weak_dummy;
+
+  std::lock_guard<std::mutex> lock(mtx);
+
+  if (auto shared = weak_dummy.lock()) {
+    return shared;
+  }
+
+  auto shared = std::make_shared<DummyTable>();
+  weak_dummy = shared;
+  return shared;
 }
 
 /**

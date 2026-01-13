@@ -33,7 +33,7 @@ class Hyrise : public Singleton<Hyrise> {
 
   // Singleton base makes moving the whole Hyrise object impossible/undesirable.
   Hyrise(Hyrise&&) noexcept = delete;
-  Hyrise& operator=(Hyrise&& other) noexcept;
+  Hyrise& operator=(Hyrise&& other) noexcept = delete;
 
   Hyrise(const Hyrise&) = delete;
   Hyrise& operator=(const Hyrise&) = delete;

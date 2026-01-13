@@ -79,7 +79,14 @@ void test_output(const std::shared_ptr<AbstractOperator> in,
 template <typename T>
 class OperatorsAggregateTest : public BaseTest {
  public:
-  static void SetUpTestCase() {  // called ONCE before the tests
+  static void SetUpTestCase() {}
+
+  static void TearDownTestCase() {}
+
+ protected:
+  void SetUp() override {
+    BaseTest::SetUp();
+
     _table_wrapper_1_0 = std::make_shared<TableWrapper>(
         load_table("resources/test_data/tbl/aggregateoperator/groupby_int_1gb_0agg/input.tbl", ChunkOffset{2}));
     _table_wrapper_1_0->never_clear_output();
@@ -165,21 +172,25 @@ class OperatorsAggregateTest : public BaseTest {
     _table_wrapper_2_o_b->never_clear_output();
     _table_wrapper_2_o_b->execute();
 
-    auto test_table =
-        load_table("resources/test_data/tbl/aggregateoperator/groupby_int_1gb_1agg/input.tbl", ChunkOffset{2});
-    ChunkEncoder::encode_all_chunks(test_table);
+    {
+      auto test_table =
+          load_table("resources/test_data/tbl/aggregateoperator/groupby_int_1gb_1agg/input.tbl", ChunkOffset{2});
+      ChunkEncoder::encode_all_chunks(test_table);
 
-    _table_wrapper_1_1_dict = std::make_shared<TableWrapper>(std::move(test_table));
-    _table_wrapper_1_1_dict->never_clear_output();
-    _table_wrapper_1_1_dict->execute();
+      _table_wrapper_1_1_dict = std::make_shared<TableWrapper>(std::move(test_table));
+      _table_wrapper_1_1_dict->never_clear_output();
+      _table_wrapper_1_1_dict->execute();
+    }
 
-    test_table =
-        load_table("resources/test_data/tbl/aggregateoperator/groupby_int_1gb_1agg/input_null.tbl", ChunkOffset{2});
-    ChunkEncoder::encode_all_chunks(test_table);
+    {
+      auto test_table =
+          load_table("resources/test_data/tbl/aggregateoperator/groupby_int_1gb_1agg/input_null.tbl", ChunkOffset{2});
+      ChunkEncoder::encode_all_chunks(test_table);
 
-    _table_wrapper_1_1_null_dict = std::make_shared<TableWrapper>(std::move(test_table));
-    _table_wrapper_1_1_null_dict->never_clear_output();
-    _table_wrapper_1_1_null_dict->execute();
+      _table_wrapper_1_1_null_dict = std::make_shared<TableWrapper>(std::move(test_table));
+      _table_wrapper_1_1_null_dict->never_clear_output();
+      _table_wrapper_1_1_null_dict->execute();
+    }
 
     _table_wrapper_int_int =
         std::make_shared<TableWrapper>(load_table("resources/test_data/tbl/int_int.tbl", ChunkOffset{2}));
@@ -187,10 +198,33 @@ class OperatorsAggregateTest : public BaseTest {
     _table_wrapper_int_int->execute();
   }
 
- protected:
-  void SetUp() override {}
+  void TearDown() override {
+    _table_wrapper_1_0.reset();
+    _table_wrapper_1_0_null.reset();
+    _table_wrapper_1_1.reset();
+    _table_wrapper_1_1_null.reset();
+    _table_wrapper_1_1_large.reset();
+    _table_wrapper_join_1.reset();
+    _table_wrapper_join_2.reset();
+    _table_wrapper_1_2.reset();
+    _table_wrapper_2_1.reset();
+    _table_wrapper_2_2.reset();
+    _table_wrapper_2_0_null.reset();
+    _table_wrapper_3_1.reset();
+    _table_wrapper_3_2.reset();
+    _table_wrapper_3_0_null.reset();
+    _table_wrapper_1_1_string.reset();
+    _table_wrapper_1_1_string_null.reset();
+    _table_wrapper_1_1_dict.reset();
+    _table_wrapper_1_1_null_dict.reset();
+    _table_wrapper_2_0_a.reset();
+    _table_wrapper_2_o_b.reset();
+    _table_wrapper_int_int.reset();
 
-  inline static std::shared_ptr<TableWrapper> _table_wrapper_1_0, _table_wrapper_1_0_null, _table_wrapper_1_1,
+    BaseTest::TearDown();
+  }
+
+  std::shared_ptr<TableWrapper> _table_wrapper_1_0, _table_wrapper_1_0_null, _table_wrapper_1_1,
       _table_wrapper_1_1_null, _table_wrapper_1_1_large, _table_wrapper_join_1, _table_wrapper_join_2,
       _table_wrapper_1_2, _table_wrapper_2_1, _table_wrapper_2_2, _table_wrapper_2_0_null, _table_wrapper_3_1,
       _table_wrapper_3_2, _table_wrapper_3_0_null, _table_wrapper_1_1_string, _table_wrapper_1_1_string_null,

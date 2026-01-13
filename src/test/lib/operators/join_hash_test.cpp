@@ -8,41 +8,63 @@ namespace hyrise {
 
 class OperatorsJoinHashTest : public BaseTest {
  protected:
-  static void SetUpTestCase() {
+  static void SetUpTestCase() {}
+  static void TearDownTestCase() {}
+
+  void SetUp() override {
+    BaseTest::SetUp();
+
     _table_wrapper_small = std::make_shared<TableWrapper>(
         load_table("resources/test_data/tbl/join_operators/anti_int4.tbl", ChunkOffset{2}));
+    _table_wrapper_small->never_clear_output();
     _table_wrapper_small->execute();
 
     _table_tpch_orders =
         std::make_shared<TableWrapper>(load_table("resources/test_data/tbl/tpch/sf-0.001/orders.tbl", ChunkOffset{10}));
+    _table_tpch_orders->never_clear_output();
     _table_tpch_orders->execute();
 
     _table_tpch_lineitems = std::make_shared<TableWrapper>(
         load_table("resources/test_data/tbl/tpch/sf-0.001/lineitem.tbl", ChunkOffset{10}));
+    _table_tpch_lineitems->never_clear_output();
     _table_tpch_lineitems->execute();
 
     _table_with_nulls =
         std::make_shared<TableWrapper>(load_table("resources/test_data/tbl/int_int4_with_null.tbl", ChunkOffset{10}));
+    _table_with_nulls->never_clear_output();
     _table_with_nulls->execute();
 
     // filters retain all rows
     _table_tpch_orders_scanned = create_table_scan(_table_tpch_orders, ColumnID{0}, PredicateCondition::GreaterThan, 0);
+    _table_tpch_orders_scanned->never_clear_output();
     _table_tpch_orders_scanned->execute();
+
     _table_tpch_lineitems_scanned =
         create_table_scan(_table_tpch_lineitems, ColumnID{0}, PredicateCondition::GreaterThan, 0);
+    _table_tpch_lineitems_scanned->never_clear_output();
     _table_tpch_lineitems_scanned->execute();
-  }
 
-  void SetUp() override {
     const auto dummy_table =
         std::make_shared<Table>(TableColumnDefinitions{{"a", DataType::Int, false}}, TableType::Data);
     dummy_input = std::make_shared<TableWrapper>(dummy_table);
   }
 
+  void TearDown() override {
+    _table_tpch_lineitems_scanned.reset();
+    _table_tpch_orders_scanned.reset();
+    _table_with_nulls.reset();
+    _table_tpch_lineitems.reset();
+    _table_tpch_orders.reset();
+    _table_wrapper_small.reset();
+    dummy_input.reset();
+
+    BaseTest::TearDown();
+  }
+
   std::shared_ptr<AbstractOperator> dummy_input;
-  inline static std::shared_ptr<TableWrapper> _table_wrapper_small, _table_tpch_orders, _table_tpch_lineitems,
-      _table_with_nulls;
-  inline static std::shared_ptr<TableScan> _table_tpch_orders_scanned, _table_tpch_lineitems_scanned;
+
+  std::shared_ptr<TableWrapper> _table_wrapper_small, _table_tpch_orders, _table_tpch_lineitems, _table_with_nulls;
+  std::shared_ptr<TableScan> _table_tpch_orders_scanned, _table_tpch_lineitems_scanned;
 };
 
 TEST_F(OperatorsJoinHashTest, OperatorName) {

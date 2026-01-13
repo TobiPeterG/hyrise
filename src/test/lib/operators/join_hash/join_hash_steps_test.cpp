@@ -15,7 +15,12 @@ namespace hyrise {
 
 class JoinHashStepsTest : public BaseTest {
  protected:
-  static void SetUpTestCase() {
+  static void SetUpTestCase() {}
+  static void TearDownTestCase() {}
+
+  void SetUp() override {
+    BaseTest::SetUp();
+
     TableColumnDefinitions column_definitions;
     column_definitions.emplace_back("a", DataType::Int, false);
     _table_zero_one = std::make_shared<Table>(column_definitions, TableType::Data, _chunk_size_zero_one);
@@ -40,7 +45,14 @@ class JoinHashStepsTest : public BaseTest {
     _table_with_nulls_and_zeros_scanned->execute();
   }
 
-  void SetUp() override {}
+  void TearDown() override {
+    _table_with_nulls_and_zeros_scanned.reset();
+    _table_with_nulls_and_zeros.reset();
+    _table_int_with_nulls.reset();
+    _table_zero_one.reset();
+
+    BaseTest::TearDown();
+  }
 
   // Accumulates the RowIDs hidden behind the iterator element (hash map stores PosLists, not RowIDs)
   template <typename Iter>
@@ -54,9 +66,10 @@ class JoinHashStepsTest : public BaseTest {
 
   inline static auto _table_size_zero_one = ChunkOffset{1'000};
   inline static auto _chunk_size_zero_one = ChunkOffset{10};
-  inline static std::shared_ptr<Table> _table_zero_one;
-  inline static std::shared_ptr<TableWrapper> _table_int_with_nulls, _table_with_nulls_and_zeros;
-  inline static std::shared_ptr<TableScan> _table_with_nulls_and_zeros_scanned;
+
+  std::shared_ptr<Table> _table_zero_one;
+  std::shared_ptr<TableWrapper> _table_int_with_nulls, _table_with_nulls_and_zeros;
+  std::shared_ptr<TableScan> _table_with_nulls_and_zeros_scanned;
 };
 
 TEST_F(JoinHashStepsTest, SmallHashTableAllPositions) {

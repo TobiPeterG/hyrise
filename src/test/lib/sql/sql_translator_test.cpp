@@ -45,26 +45,29 @@ using namespace expression_functional;  // NOLINT(build/namespaces)
 
 class SQLTranslatorTest : public BaseTest {
  public:
-  static void SetUpTestSuite() {
+  static void SetUpTestSuite() {}
+  static void TearDownTestSuite() {}
+
+  void SetUp() override {
+    BaseTest::SetUp();
+
     int_float = load_table("resources/test_data/tbl/int_float.tbl");
     int_string = load_table("resources/test_data/tbl/int_string.tbl");
     int_float2 = load_table("resources/test_data/tbl/int_float2.tbl");
     int_float5 = load_table("resources/test_data/tbl/int_float5.tbl");
     int_int_int = load_table("resources/test_data/tbl/int_int_int.tbl");
-  }
-
-  void SetUp() override {
-    stored_table_node_int_float = StoredTableNode::make("int_float");
-    stored_table_node_int_string = StoredTableNode::make("int_string");
-    stored_table_node_int_float2 = StoredTableNode::make("int_float2");
-    stored_table_node_int_float5 = StoredTableNode::make("int_float5");
-    stored_table_node_int_int_int = StoredTableNode::make("int_int_int");
 
     Hyrise::get().storage_manager.add_table("int_float", int_float);
     Hyrise::get().storage_manager.add_table("int_string", int_string);
     Hyrise::get().storage_manager.add_table("int_float2", int_float2);
     Hyrise::get().storage_manager.add_table("int_float5", int_float5);
     Hyrise::get().storage_manager.add_table("int_int_int", int_int_int);
+
+    stored_table_node_int_float = StoredTableNode::make("int_float");
+    stored_table_node_int_string = StoredTableNode::make("int_string");
+    stored_table_node_int_float2 = StoredTableNode::make("int_float2");
+    stored_table_node_int_float5 = StoredTableNode::make("int_float5");
+    stored_table_node_int_int_int = StoredTableNode::make("int_int_int");
 
     int_float_a = stored_table_node_int_float->get_column("a");
     int_float_b = stored_table_node_int_float->get_column("b");
@@ -77,6 +80,50 @@ class SQLTranslatorTest : public BaseTest {
     int_int_int_a = stored_table_node_int_int_int->get_column("a");
     int_int_int_b = stored_table_node_int_int_int->get_column("b");
     int_int_int_c = stored_table_node_int_int_int->get_column("c");
+  }
+
+  void TearDown() override {
+    if (Hyrise::get().storage_manager.has_table("int_float")) {
+      Hyrise::get().storage_manager.drop_table("int_float");
+    }
+    if (Hyrise::get().storage_manager.has_table("int_string")) {
+      Hyrise::get().storage_manager.drop_table("int_string");
+    }
+    if (Hyrise::get().storage_manager.has_table("int_float2")) {
+      Hyrise::get().storage_manager.drop_table("int_float2");
+    }
+    if (Hyrise::get().storage_manager.has_table("int_float5")) {
+      Hyrise::get().storage_manager.drop_table("int_float5");
+    }
+    if (Hyrise::get().storage_manager.has_table("int_int_int")) {
+      Hyrise::get().storage_manager.drop_table("int_int_int");
+    }
+
+    int_float_a.reset();
+    int_float_b.reset();
+    int_string_a.reset();
+    int_string_b.reset();
+    int_float5_a.reset();
+    int_float5_d.reset();
+    int_float2_a.reset();
+    int_float2_b.reset();
+    int_int_int_a.reset();
+    int_int_int_b.reset();
+    int_int_int_c.reset();
+
+    stored_table_node_int_float.reset();
+    stored_table_node_int_string.reset();
+    stored_table_node_int_float2.reset();
+    stored_table_node_int_float5.reset();
+    stored_table_node_int_int_int.reset();
+
+    int_float.reset();
+    int_string.reset();
+    int_float2.reset();
+    int_float5.reset();
+    int_int_int.reset();
+
+    BaseTest::TearDown();
   }
 
   std::pair<std::shared_ptr<AbstractLQPNode>, SQLTranslationInfo> sql_to_lqp_helper(
@@ -92,8 +139,8 @@ class SQLTranslatorTest : public BaseTest {
     return {lqps.at(0), translation_result.translation_info};
   }
 
-  static inline std::shared_ptr<Table> int_float, int_string, int_float2, int_float5, int_int_int;
-  static inline std::shared_ptr<StoredTableNode> stored_table_node_int_float, stored_table_node_int_string,
+  std::shared_ptr<Table> int_float, int_string, int_float2, int_float5, int_int_int;
+  std::shared_ptr<StoredTableNode> stored_table_node_int_float, stored_table_node_int_string,
       stored_table_node_int_float2, stored_table_node_int_float5, stored_table_node_int_int_int;
   std::shared_ptr<LQPColumnExpression> int_float_a, int_float_b, int_string_a, int_string_b, int_float5_a, int_float5_d,
       int_float2_a, int_float2_b, int_int_int_a, int_int_int_b, int_int_int_c;

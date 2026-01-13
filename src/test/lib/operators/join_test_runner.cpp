@@ -520,9 +520,9 @@ class JoinTestRunner : public BaseTestWithParam<JoinTestConfiguration> {
     return "resources/test_data/tbl/join_test_runner/input_table_"s + side_str + "_" + table_size_str + ".tbl";
   }
 
-  static std::shared_ptr<Table> get_table(const InputTableConfiguration& key) {
-    auto input_table_iter = input_tables.find(key);
-    if (input_table_iter == input_tables.end()) {
+  std::shared_ptr<Table> get_table(const InputTableConfiguration& key) {
+    auto input_table_iter = _input_tables.find(key);
+    if (input_table_iter == _input_tables.end()) {
       const auto& [side, chunk_size, table_size, input_table_type, encoding_type, indexed_chunk_range,
                    single_chunk_reference_range] = key;
       std::ignore = side;
@@ -609,18 +609,24 @@ class JoinTestRunner : public BaseTestWithParam<JoinTestConfiguration> {
       }
 
       if (reference_table) {
-        input_table_iter = input_tables.emplace(key, reference_table).first;
+        input_table_iter = _input_tables.emplace(key, reference_table).first;
       } else {
-        input_table_iter = input_tables.emplace(key, data_table).first;
+        input_table_iter = _input_tables.emplace(key, data_table).first;
       }
     }
 
     return input_table_iter->second;
   }
 
-  static inline std::map<InputTableConfiguration, std::shared_ptr<Table>> input_tables;
+  void TearDown() override {
+    _expected_output_tables.clear();
+    _input_tables.clear();
+    BaseTestWithParam<JoinTestConfiguration>::TearDown();
+  }
+
+  std::map<InputTableConfiguration, std::shared_ptr<Table>> _input_tables;
   // Cache reference table to avoid redundant computation of the same
-  static inline std::map<JoinTestConfiguration, std::shared_ptr<const Table>> expected_output_tables;
+  std::map<JoinTestConfiguration, std::shared_ptr<const Table>> _expected_output_tables;
 };  // namespace hyrise
 
 TEST_P(JoinTestRunner, TestJoin) {
@@ -690,7 +696,7 @@ TEST_P(JoinTestRunner, TestJoin) {
     std::cout << "===================== Right Input Table ====================" << std::endl;
     Print::print(right_input_table, PrintFlags::IgnoreChunkBoundaries);
     std::cout << "Chunk size: " << configuration.right_input.chunk_size << std::endl;
-    std::cout << "Table size: " << input_table_type_to_string.at(configuration.right_input.table_type) << std::endl;
+    std::cout << "Table type: " << input_table_type_to_string.at(configuration.right_input.table_type) << std::endl;
     std::cout << "Indexed chunk range: [" << configuration.right_input.indexed_chunk_range.first << ", "
               << configuration.right_input.indexed_chunk_range.second << ")" << std::endl;
     std::cout << "Chunk range with single chunk ref. guarantee: ["
@@ -713,26 +719,34 @@ TEST_P(JoinTestRunner, TestJoin) {
       std::cout << "No Table produced by the reference join operator" << std::endl;
     }
     std::cout << "======================== Difference ========================" << std::endl;
-    std::cout << *table_difference_message << std::endl;
+    if (table_difference_message) {
+      std::cout << *table_difference_message << std::endl;
+    } else {
+      std::cout << "<no table difference available (comparison not executed)>" << std::endl;
+    }
     std::cout << "============================================================" << std::endl;
   };
 
   try {
-    auto expected_output_table_iter = expected_output_tables.find(cached_output_configuration);
+    auto expected_output_table_iter = _expected_output_tables.find(cached_output_configuration);
 
-    // Cache reference table to avoid redundant computation of the same
-    if (expected_output_table_iter == expected_output_tables.end()) {
+    if (expected_output_table_iter == _expected_output_tables.end()) {
       join_verification->execute();
       const auto expected_output_table = join_verification->get_output();
       expected_output_table_iter =
-          expected_output_tables.emplace(cached_output_configuration, expected_output_table).first;
+          _expected_output_tables.emplace(cached_output_configuration, expected_output_table).first;
     }
     expected_table = expected_output_table_iter->second;
 
     // Execute the actual join
     join_op->execute();
+  } catch (const std::exception& e) {
+    table_difference_message = std::string{"Exception while executing join test: "} + e.what();
+    print_configuration_info();
+    throw;
   } catch (...) {
     // If an error occurred in the join operator under test, we still want to see the test configuration
+    table_difference_message = "Unknown exception while executing join test.";
     print_configuration_info();
     throw;
   }

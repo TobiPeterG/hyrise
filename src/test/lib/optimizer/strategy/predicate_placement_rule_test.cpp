@@ -23,15 +23,18 @@ using namespace expression_functional;  // NOLINT(build/namespaces)
 
 class PredicatePlacementRuleTest : public StrategyBaseTest {
  protected:
-  static void SetUpTestSuite() {
+  static void SetUpTestSuite() {}
+  static void TearDownTestSuite() {}
+
+  void SetUp() override {
+    StrategyBaseTest::SetUp();
+
     _table_a = load_table("resources/test_data/tbl/int_float.tbl");
     _table_b = load_table("resources/test_data/tbl/int_float2.tbl");
     _table_c = load_table("resources/test_data/tbl/int_float3.tbl");
     _table_d = load_table("resources/test_data/tbl/int_int3.tbl");
     _table_e = load_table("resources/test_data/tbl/int_int4.tbl");
-  }
 
-  void SetUp() override {
     Hyrise::get().storage_manager.add_table("a", _table_a);
     _stored_table_a = StoredTableNode::make("a");
     _a_a = _stored_table_a->get_column("a");
@@ -74,7 +77,44 @@ class PredicatePlacementRuleTest : public StrategyBaseTest {
     _subquery = lqp_subquery_(subquery_lqp, std::make_pair(ParameterID{0}, _a_a));
   }
 
-  inline static std::shared_ptr<Table> _table_a, _table_b, _table_c, _table_d, _table_e;
+  void TearDown() override {
+    if (Hyrise::get().storage_manager.has_table("a")) Hyrise::get().storage_manager.drop_table("a");
+    if (Hyrise::get().storage_manager.has_table("b")) Hyrise::get().storage_manager.drop_table("b");
+    if (Hyrise::get().storage_manager.has_table("c")) Hyrise::get().storage_manager.drop_table("c");
+    if (Hyrise::get().storage_manager.has_table("d")) Hyrise::get().storage_manager.drop_table("d");
+    if (Hyrise::get().storage_manager.has_table("e")) Hyrise::get().storage_manager.drop_table("e");
+
+    _subquery.reset();
+    _subquery_c.reset();
+
+    _e_a.reset();
+    _d_b.reset();
+    _d_a.reset();
+    _c_b.reset();
+    _c_a.reset();
+    _b_b.reset();
+    _b_a.reset();
+    _a_b.reset();
+    _a_a.reset();
+
+    _stored_table_e.reset();
+    _stored_table_d.reset();
+    _stored_table_c.reset();
+    _stored_table_b.reset();
+    _stored_table_a.reset();
+
+    _rule.reset();
+
+    _table_e.reset();
+    _table_d.reset();
+    _table_c.reset();
+    _table_b.reset();
+    _table_a.reset();
+
+    StrategyBaseTest::TearDown();
+  }
+
+  std::shared_ptr<Table> _table_a, _table_b, _table_c, _table_d, _table_e;
   std::shared_ptr<PredicatePlacementRule> _rule;
   std::shared_ptr<StoredTableNode> _stored_table_a, _stored_table_b, _stored_table_c, _stored_table_d, _stored_table_e;
   std::shared_ptr<LQPColumnExpression> _a_a, _a_b, _b_a, _b_b, _c_a, _c_b, _d_a, _d_b, _e_a;

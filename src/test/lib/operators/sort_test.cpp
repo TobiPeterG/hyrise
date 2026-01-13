@@ -19,15 +19,27 @@ struct SortTestParam {
 
 class SortTest : public BaseTestWithParam<SortTestParam> {
  public:
-  static void SetUpTestCase() {
+  static void SetUpTestCase() {}
+  static void TearDownTestCase() {}
+
+  void SetUp() override {
+    BaseTestWithParam<SortTestParam>::SetUp();
+
     input_table = load_table("resources/test_data/tbl/sort/input.tbl", ChunkOffset{20});
     input_table_wrapper = std::make_shared<TableWrapper>(input_table);
     input_table_wrapper->never_clear_output();
     input_table_wrapper->execute();
   }
 
-  static inline std::shared_ptr<Table> input_table;
-  static inline std::shared_ptr<AbstractOperator> input_table_wrapper;
+  void TearDown() override {
+    input_table_wrapper.reset();
+    input_table.reset();
+
+    BaseTestWithParam<SortTestParam>::TearDown();
+  }
+
+  std::shared_ptr<Table> input_table;
+  std::shared_ptr<AbstractOperator> input_table_wrapper;
 };
 
 TEST_P(SortTest, Sort) {
