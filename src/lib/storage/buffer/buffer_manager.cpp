@@ -631,10 +631,10 @@ PageID BufferManager::find_page(const void* ptr) const {
 
 void BufferManager::add_to_eviction_queue(const PageID page_id, Frame* frame) {
   if (frame->node_id() == _primary_buffer_pool->node_id) {
-    _primary_buffer_pool->add_to_eviction_queue(page_id, frame);
+    _primary_buffer_pool->add_eviction_candidate(page_id, frame);
   } else if (frame->node_id() == _secondary_buffer_pool->node_id) {
     DebugAssert(_secondary_buffer_pool->enabled, "Pool has to be enabled");
-    _secondary_buffer_pool->add_to_eviction_queue(page_id, frame);
+    _secondary_buffer_pool->add_eviction_candidate(page_id, frame);
   } else {
     Fail("Cannot find buffer pool for given memory node " + std::to_string(frame->node_id()));
   }

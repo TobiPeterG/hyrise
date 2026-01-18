@@ -459,6 +459,8 @@ set(
     storage/buffer/buffer_manager.hpp
     storage/buffer/buffer_pool.cpp
     storage/buffer/buffer_pool.hpp
+    storage/buffer/eviction_strategy.cpp
+    storage/buffer/eviction_strategy.hpp
     storage/buffer/jemalloc_resource.cpp
     storage/buffer/jemalloc_resource.hpp
     storage/buffer/metrics.hpp
@@ -478,6 +480,10 @@ set(
     storage/buffer/helper.hpp
     storage/buffer/volatile_region.cpp
     storage/buffer/volatile_region.hpp
+    storage/buffer/eviction_strategies/second_chance_eviction.cpp
+    storage/buffer/eviction_strategies/second_chance_eviction.hpp
+    storage/buffer/eviction_strategies/sieve_eviction.cpp
+    storage/buffer/eviction_strategies/sieve_eviction.hpp
     storage/dictionary_segment.cpp
     storage/dictionary_segment.hpp
     storage/dictionary_segment/attribute_vector_iterable.hpp

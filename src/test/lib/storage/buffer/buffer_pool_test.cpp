@@ -110,7 +110,7 @@ TEST_F(BufferPoolTest, TestAddToEvictionQueueIncrementsMetric) {
   ASSERT_NE(frame, nullptr);
   ASSERT_NE(ptr, nullptr);
 
-  // To satisfy add_to_eviction_queue's DebugAssert(frame->node_id() == node_id),
+  // To satisfy add_eviction_candidate's DebugAssert(frame->node_id() == node_id),
   // we need to set the frame's node_id while exclusively locked.
   auto state_and_version = frame->state_and_version();
   ASSERT_TRUE(frame->try_lock_exclusive(state_and_version));
@@ -118,7 +118,7 @@ TEST_F(BufferPoolTest, TestAddToEvictionQueueIncrementsMetric) {
   frame->unlock_exclusive();
 
   const auto before_adds = pool.metrics->num_eviction_queue_adds.load(std::memory_order_relaxed);
-  pool.add_to_eviction_queue(page_id, frame);
+  pool.add_eviction_candidate(page_id, frame);
   const auto after_adds = pool.metrics->num_eviction_queue_adds.load(std::memory_order_relaxed);
   EXPECT_EQ(after_adds, before_adds + 1);
 
@@ -204,7 +204,7 @@ TEST_F(BufferPoolTest, TestEnsureFreePagesEvictsMarkedPageToSSDAndFreesBudget) {
   EXPECT_EQ(pool.used_bytes.load(std::memory_order_relaxed), pool_size);
 
   // Add the victim to the eviction queue with the current version timestamp.
-  pool.add_to_eviction_queue(page_id, frame);
+  pool.add_eviction_candidate(page_id, frame);
 
   const auto bytes_to_ssd_before = pool.metrics->total_bytes_copied_to_ssd.load(std::memory_order_relaxed);
   const auto evictions_before = pool.metrics->num_evictions.load(std::memory_order_relaxed);
@@ -258,10 +258,10 @@ TEST_F(BufferPoolTest, TestPurgeEvictionQueueKeepsEvictableOrMarkableItems) {
   }
 
   // Push item with matching timestamp
-  pool.add_to_eviction_queue(page_id, frame);
+  pool.add_eviction_candidate(page_id, frame);
 
-  // purge_eviction_queue should see item.can_mark(...) and push it back
-  pool.purge_eviction_queue();
+  // purge_eviction_candidates should see item.can_mark(...) and push it back
+  pool.purge_eviction_candidates();
 
   // Force pressure: small max_bytes and full budget
   pool.used_bytes.store(pool.max_bytes, std::memory_order_relaxed);

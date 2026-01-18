@@ -1,4 +1,7 @@
 #include "buffer_pool.hpp"
+
+#include <storage/buffer/eviction_strategies/second_chance_eviction.hpp>
+#include <storage/buffer/eviction_strategies/sieve_eviction.hpp>
 #include "metrics.hpp"
 #include "storage/buffer/ssd_region.hpp"
 #include "volatile_region.hpp"
@@ -27,14 +30,14 @@ BufferPool::BufferPool(const bool enabled, const size_t pool_size, const bool en
       metrics(metrics),
       enabled(enabled),
       volatile_regions(volatile_regions),
-      eviction_queue(std::make_unique<EvictionQueue>()),
       node_id(numa_node),
       ssd_region(ssd_region),
       target_buffer_pool(target_buffer_pool),
+      eviction_strategy(std::make_unique<SieveEviction>(*this)),
       migration_policy(migration_policy),
       eviction_purge_worker(enable_eviction_purge_worker
                                 ? std::make_unique<PausableLoopThread>(IDLE_EVICTION_QUEUE_PURGE,
-                                                                       [&](size_t) { this->purge_eviction_queue(); })
+                                                                       [&](size_t) { eviction_strategy->purge_eviction_candidates(); })
                                 : nullptr) {}
 
 #ifndef NDEBUG
@@ -64,30 +67,12 @@ static std::string debug_backtrace() {
 }
 #endif
 
-void BufferPool::purge_eviction_queue() {
-  auto item = EvictionItem{};
-  for (auto i = size_t{0}; i < MAX_EVICTION_QUEUE_PURGES; ++i) {
-    if (!eviction_queue->try_pop(item)) {
-      return;
-    }
-
-    auto region = volatile_regions[static_cast<uint64_t>(item.page_id.size_type())];
-    auto frame = region->get_frame(item.page_id);
-    auto current_state_and_version = frame->state_and_version();
-
-    // The item is in state UNLOCKED and can be marked
-    if (item.can_evict(current_state_and_version) || item.can_mark(current_state_and_version)) {
-      eviction_queue->push(item);
-      continue;
-    }
-  }
+void BufferPool::add_eviction_candidate(const PageID page_id, Frame* frame) {
+  eviction_strategy->add_eviction_candidate(page_id, frame);
 }
 
-void BufferPool::add_to_eviction_queue(const PageID page_id, Frame* frame) {
-  auto current_state_and_version = frame->state_and_version();
-  DebugAssert(frame->node_id() == node_id, "Memory node mismatch");
-  increment_counter(metrics->num_eviction_queue_adds);
-  eviction_queue->push({page_id, Frame::version(current_state_and_version)});
+void BufferPool::purge_eviction_candidates() {
+  eviction_strategy->purge_eviction_candidates();
 }
 
 void BufferPool::free_bytes(const uint64_t bytes) {
@@ -149,77 +134,8 @@ uint64_t BufferPool::reserve_bytes(const uint64_t bytes) {
   return before;
 }
 
-bool BufferPool::ensure_free_pages(const PageSizeType required_size) {
-  // TODO: Free at least 64 * PageSite bytes to reduce TLB shootdowns
-  const auto bytes_required = bytes_for_size_type(required_size);
-  auto freed_bytes = size_t{0};
-
-  reserve_bytes(bytes_required);
-
-  auto item = EvictionItem{};
-
-  // Find potential victim frame if we don't have enough space left
-  // TODO: Verify, that this is correct, cceh kthe numbersm, verify value type
-  while (used_bytes.load(std::memory_order_relaxed) > max_bytes) {
-    if (!eviction_queue->try_pop(item)) {
-#ifndef NDEBUG
-      std::cerr << "[BM][DEBUG] ensure_free_pages failed: eviction_queue empty"
-                << " required_bytes=" << bytes_required
-                << " used_bytes=" << used_bytes.load(std::memory_order_relaxed)
-                << " max_bytes=" << max_bytes
-                << " freed_bytes=" << freed_bytes
-                << " node_id=" << node_id
-                << "\n";
-#endif
-      free_bytes(bytes_required);  // TODO: Check if this is correct
-      return false;
-    }
-
-    auto region = volatile_regions[static_cast<uint64_t>(item.page_id.size_type())];
-    auto frame = region->get_frame(item.page_id);
-    auto current_state_and_version = frame->state_and_version();
-
-    if (frame->node_id() != node_id) {
-      increment_counter(metrics->num_eviction_queue_items_purged);
-      continue;
-    }
-
-    // If the frame is already marked, we can evict it
-    if (!item.can_evict(current_state_and_version)) {
-      // If the frame is UNLOCKED, we can mark it
-      if (item.can_mark(current_state_and_version)) {
-        if (frame->try_mark(current_state_and_version)) {
-          add_to_eviction_queue(item.page_id, frame);
-          continue;
-        }
-      }
-      increment_counter(metrics->num_eviction_queue_items_purged);
-      continue;
-    }
-
-    // Try locking the frame exclusively, TODO: prefer shared locking
-    if (!frame->try_lock_exclusive(current_state_and_version)) {
-      increment_counter(metrics->num_eviction_queue_items_purged);
-      continue;
-    }
-
-    Assert(frame->node_id() == node_id,
-           "Memory node mismatch: " + std::to_string(frame->node_id()) + " != " + std::to_string(node_id));
-
-    evict(item, frame);
-
-    increment_counter(metrics->num_evictions);
-
-    // DebugAssert(Frame::state(frame->state_and_version()) != Frame::LOCKED, "Frame cannot be locked");
-
-    const auto size_type = item.page_id.size_type();
-    const auto evicted_bytes = bytes_for_size_type(size_type);
-    freed_bytes += evicted_bytes;
-
-    free_bytes(evicted_bytes);
-  }
-
-  return true;
+bool BufferPool::ensure_free_pages(const PageSizeType required_size) const {
+  return eviction_strategy->perform_evictions(required_size);
 }
 
 void BufferPool::evict(EvictionItem& item, Frame* frame) {
@@ -278,7 +194,7 @@ void BufferPool::evict(EvictionItem& item, Frame* frame) {
       frame->set_node_id(target_buffer_pool->node_id);
 
       frame->unlock_exclusive();
-      target_buffer_pool->add_to_eviction_queue(item.page_id, frame);
+      target_buffer_pool->add_eviction_candidate(item.page_id, frame);
       //   TODO:increment_counter(metrics.total_bytes_copied_from_dram_to_numa, num_bytes);
       return;
     }
@@ -287,7 +203,9 @@ void BufferPool::evict(EvictionItem& item, Frame* frame) {
 }
 
 size_t BufferPool::memory_consumption() const {
-  return sizeof(*this) + sizeof(*eviction_queue) + sizeof(EvictionQueue::value_type) * eviction_queue->unsafe_size();
+  // TODO:: does adding the eviction strategy's consumption make sense here? Aligning to the old implementation, I think
+  // so.
+  return sizeof(*this) + eviction_strategy->memory_consumption();
 }
 
 size_t BufferPool::free_bytes_node() const {
