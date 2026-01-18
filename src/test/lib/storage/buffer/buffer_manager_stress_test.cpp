@@ -6,6 +6,7 @@
 #include "base_test.hpp"
 #include "hyrise.hpp"
 #include "scheduler/node_queue_scheduler.hpp"
+#include "storage/buffer/pin_guard.hpp"
 
 namespace hyrise {
 
@@ -46,15 +47,15 @@ TEST_F(BufferManagerStressTest, TestVariousAllocationsReadWrites) {
 
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       {
-        ReadPinGuard guard{vector};
+        SharedReadPinGuard guard{vector};
         EXPECT_FALSE(std::is_sorted(vector.begin(), vector.end()));
       }
       {
-        WritePinGuard guard{vector};
+        ExclusivePinGuard guard{vector};
         std::sort(vector.begin(), vector.end());
       }
       {
-        ReadPinGuard guard{vector};
+        SharedReadPinGuard guard{vector};
 
         EXPECT_EQ(*vector.begin(), i);
         EXPECT_EQ(*(vector.end() - 1), vector_sizes[i] + i - 1);
