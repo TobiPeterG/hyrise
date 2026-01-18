@@ -7,6 +7,7 @@
 #include <future>
 #include <random>
 #include <thread>
+#include <filesystem>
 #include "base_test.hpp"
 
 #include "concurrency/commit_context.hpp"
@@ -20,7 +21,23 @@ class BufferManagerStressTest : public BaseTest {
 };
 
 TEST_F(BufferManagerStressTest, TestPinAndUnpins) {
-  auto bm = BufferManager{{.dram_buffer_pool_size = 1 << 20, .ssd_path = "./build"}};
+  const auto ssd_path = std::filesystem::path{"./stress_test"};
+
+  // Ensure SSD path exists before BufferManager/SSDRegion checks it.
+  std::error_code ec;  // added
+  std::filesystem::create_directories(ssd_path, ec);
+  ASSERT_FALSE(ec) << "Failed to create SSD directory \"" << ssd_path.string() << "\": " << ec.message();  // added
+  ASSERT_TRUE(std::filesystem::is_directory(ssd_path))
+      << "SSD path is not a directory: \"" << ssd_path.string() << "\"";
+
+  auto bm = BufferManager{{
+      .dram_buffer_pool_size = 1 << 20,
+      .numa_buffer_pool_size = 0,
+      .memory_node = NodeID{0},
+      .cpu_node = NodeID{0},
+      .enable_numa = false,
+      .ssd_path = ssd_path,
+  }};
 
   constexpr auto NUM_REQUESTS = 20000;
   constexpr auto SEED = 18731283;

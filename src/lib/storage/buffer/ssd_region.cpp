@@ -11,11 +11,33 @@ namespace hyrise {
 // TODO: Properly support block device
 
 static SSDRegion::Mode find_mode_or_fail(const std::filesystem::path& file_name) {
+  // Debug helpers: we want actionable info when this fails in tests.
+  const auto exists = std::filesystem::exists(file_name);
+  const auto is_dir = std::filesystem::is_directory(file_name);
+  const auto is_blk = std::filesystem::is_block_file(file_name);
+
+#ifndef NDEBUG
+  std::cerr << "[BM][SSDRegion] find_mode_or_fail path=\"" << file_name.string() << "\""
+            << " exists=" << exists
+            << " is_directory=" << is_dir
+            << " is_block_file=" << is_blk
+            << "\n";
+#endif
+
   if (std::filesystem::is_directory(file_name)) {
     return SSDRegion::Mode::FILE_PER_SIZE_TYPE;
   } else if (std::filesystem::is_block_file(file_name)) {
     return SSDRegion::Mode::BLOCK;
   } else {
+#ifndef NDEBUG
+    // Extra detail: what kind of file is it?
+    std::error_code ec;
+    const auto st = std::filesystem::status(file_name, ec);
+    std::cerr << "[BM][SSDRegion] status.type=" << static_cast<int>(st.type())
+              << " ec=" << ec.value()
+              << " msg=\"" << ec.message() << "\""
+              << "\n";
+#endif
     Fail("The backing file has to be either a directory or a block device");
   }
 }
