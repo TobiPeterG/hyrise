@@ -1,692 +1,350 @@
-#include <future>
-#include <memory>
-#include <thread>
-#include "base_test.hpp"
-
 #include <filesystem>
-#include "types.hpp"
+#include <system_error>
+#include <thread>
+#include <vector>
+
+#include "base_test.hpp"
+#include "storage/buffer/buffer_manager.hpp"
+#include "storage/buffer/helper.hpp"
+
+#if HYRISE_NUMA_SUPPORT
+#include <numa.h>
+#endif
 
 namespace hyrise {
 
-class BufferManagerTest : public BaseTest {
+/**
+ * We subclass BufferManager ONLY to inspect the node_id of frames
+ * after allocation. This mirrors how other buffer tests in Hyrise
+ * already inspect internals.
+ */
+class TestBufferManager final : public BufferManager {
  public:
-  static constexpr size_t default_seed = 2198738917;
+  using BufferManager::BufferManager;
 
-  BufferManager create_buffer_manager(const size_t buffer_pool_size,
-                                      const BufferManagerMode mode = BufferManagerMode::DramSSD,
-                                      const MigrationPolicy migration_policy = LazyMigrationPolicy(default_seed)) {
-    auto config = BufferManager::Config{};
-    config.dram_buffer_pool_size = buffer_pool_size;
-    config.numa_buffer_pool_size = buffer_pool_size;
-    config.ssd_path = db_file;
-    config.enable_eviction_purge_worker = false;
-    config.mode = mode;
-    config.migration_policy = migration_policy;
-    return BufferManager(config);
+  Frame* frame(const PageID page_id) {
+    return get_region(page_id)->get_frame(page_id);
   }
+};
 
-  void evict_frame(BufferManager& buffer_manager, const FramePtr& frame) {
-    buffer_manager.evict_frame(frame);
-  }
+class BufferManagerMigrationPolicyTest : public BaseTest {
+ protected:
+  void SetUp() override {
+    // Always set up the SSD directory, regardless of NUMA availability.
+    // Individual tests that REQUIRE NUMA will skip themselves.
+    _ssd_dir = std::filesystem::path{test_data_path} / "buffer_manager_migration_policy_test";
 
-  std::shared_ptr<SSDRegion> get_ssd_region(const BufferManager& buffer_manager) {
-    return buffer_manager._ssd_region;
+    std::error_code ec;
+    std::filesystem::remove_all(_ssd_dir, ec);
+    ec.clear();
+
+    std::filesystem::create_directories(_ssd_dir, ec);
+    ASSERT_FALSE(ec) << "Failed to create SSD directory: " << ec.message();
+    ASSERT_TRUE(std::filesystem::is_directory(_ssd_dir));
   }
 
   void TearDown() override {
-    std::filesystem::remove(db_file);
+    std::error_code ec;
+    std::filesystem::remove_all(_ssd_dir, ec);
   }
 
-  const std::string db_file = test_data_path + "buffer_manager.data";
+  std::filesystem::path _ssd_dir;
 };
 
-TEST_F(BufferManagerTest, TestPinAndUnpinPageLowMemory) {
-  // We create a really small buffer manager with a single frame to test pin and unpin
-  auto buffer_manager = create_buffer_manager(bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), 0);
-  const auto ptr = buffer_manager.allocate(bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-
-  const auto frame = ptr.get_frame();
-  EXPECT_TRUE(frame->is_resident());
-
-  // Pin the page. The next allocation should fail, since there is only a single buffer frame
-  // and it has a pinned page
-  buffer_manager.pin(frame);
-  EXPECT_ANY_THROW(buffer_manager.allocate(512));
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-
-  // Unpin the page. And try again. Now, the allocation works.
-  buffer_manager.unpin(frame, false);
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-  EXPECT_NO_THROW(buffer_manager.allocate(512));
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), bytes_for_size_type(PageSizeType::KiB8));
+static void require_two_numa_nodes_or_skip() {
+#if HYRISE_NUMA_SUPPORT
+  if (numa_available() < 0) {
+    GTEST_SKIP() << "NUMA not available on this system.";
+  }
+  const auto max_node = numa_max_node();  // highest node id
+  if (max_node < 1) {
+    GTEST_SKIP() << "Need at least 2 NUMA nodes (0 and 1), but system has max_node=" << max_node;
+  }
+#else
+  GTEST_SKIP() << "Built without NUMA support (HYRISE_NUMA_SUPPORT=0).";
+#endif
 }
 
-TEST_F(BufferManagerTest, TestPinAndUnpinPageWithDirtyFlag) {
-  auto buffer_manager = create_buffer_manager(bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-  const auto ptr = buffer_manager.allocate(bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-  const auto frame = ptr.get_frame();
+#define REQUIRE_TWO_NUMA_NODES_OR_RETURN()        \
+  do {                                            \
+    require_two_numa_nodes_or_skip();             \
+    if (::testing::Test::IsSkipped()) return;     \
+  } while (false)
 
-  EXPECT_EQ(frame->pin_count.load(), 0);
-  buffer_manager.pin(frame);
-  buffer_manager.pin(frame);
-  buffer_manager.pin(frame);
-  EXPECT_EQ(frame->pin_count.load(), 3);
+static TestBufferManager create_buffer_manager(const std::filesystem::path& ssd_dir, const size_t buffer_pool_size,
+                                               const MigrationPolicy& policy) {
+  auto config = BufferManager::Config{};
+  config.dram_buffer_pool_size = buffer_pool_size;
+  config.numa_buffer_pool_size = buffer_pool_size;
+  config.ssd_path = ssd_dir;
 
-  buffer_manager.unpin(frame, false);
-  EXPECT_EQ(frame->pin_count.load(), 2);
-  EXPECT_FALSE(frame->dirty.load());
+  config.enable_eviction_purge_worker = false;
+  config.enable_numa = true;
 
-  buffer_manager.unpin(frame, true);
-  EXPECT_EQ(frame->pin_count.load(), 1);
-  EXPECT_TRUE(frame->dirty.load());
+  config.cpu_node = NodeID{0};
+  config.memory_node = NodeID{1};
 
-  buffer_manager.unpin(frame, false);
-  EXPECT_EQ(frame->pin_count.load(), 0);
-  EXPECT_TRUE(frame->dirty.load());
+  config.migration_policy = policy;
+
+  return TestBufferManager{config};
 }
 
-TEST_F(BufferManagerTest, TestWriteDirtyPageToSSD) {
-  auto buffer_manager = create_buffer_manager(bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-  auto ssd_region = get_ssd_region(buffer_manager);
+static TestBufferManager create_buffer_manager_no_numa(const std::filesystem::path& ssd_dir, const size_t buffer_pool_size,
+                                                       const MigrationPolicy& policy) {
+  auto config = BufferManager::Config{};
+  config.dram_buffer_pool_size = buffer_pool_size;
+  config.numa_buffer_pool_size = buffer_pool_size;  // unused when NUMA disabled
+  config.ssd_path = ssd_dir;
 
-  const auto ptr = buffer_manager.allocate(bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-  const auto frame = ptr.get_frame();
+  config.enable_eviction_purge_worker = false;
 
-  // Write some data to the page
-  buffer_manager.pin(frame);
-  std::memset(frame->data, bytes_for_size_type(MAX_PAGE_SIZE_TYPE), 0x05);
+  // NUMA disabled: ctor asserts cpu_node == memory_node
+  config.enable_numa = false;
+  config.cpu_node = NodeID{0};
+  config.memory_node = NodeID{0};
 
-  // Unpin the page and mark it as dirty. There should be nothing on the SSD yet.
-  buffer_manager.unpin(frame, true);
-  alignas(512) std::array<uint8_t, bytes_for_size_type(MAX_PAGE_SIZE_TYPE)> read_buffer1;
-  auto read_frame =
-      make_frame(frame->page_id, frame->size_type, frame->page_type, reinterpret_cast<std::byte*>(read_buffer1.data()));
-  ssd_region->read_page(read_frame);
+  config.migration_policy = policy;
 
-  EXPECT_FALSE(std::memcmp(read_frame->data, frame->data, bytes_for_size_type(MAX_PAGE_SIZE_TYPE)) == 0)
-      << "The page should not have been written to SSD";
-
-  // Allocate a new page, which should replace the old one and write it to SSD.
-  const auto ptr2 = buffer_manager.allocate(bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-  alignas(512) std::array<uint8_t, bytes_for_size_type(MAX_PAGE_SIZE_TYPE)> read_buffer2;
-  auto read_frame2 =
-      make_frame(frame->page_id, frame->size_type, frame->page_type, reinterpret_cast<std::byte*>(read_buffer2.data()));
-  ssd_region->read_page(read_frame2);
-  EXPECT_EQ(frame->data, nullptr);
-  // TODO: We need to compare against some ground truth (setting all bytes to 0x5)
-  // EXPECT_TRUE(std::memcmp(read_frame2->data, frame->data, bytes_for_size_type(MAX_PAGE_SIZE_TYPE)) != 0)
-  //     << "The page should not have been written to SSD";
+  return TestBufferManager{config};
 }
 
-TEST_F(BufferManagerTest, TestMultipleAllocateAndDeallocate) {
-  auto buffer_manager = create_buffer_manager(bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
+/**
+ * Allocate + deallocate repeatedly and count how many allocations
+ * ended up on a specific NUMA node.
+ *
+ * Note: We cannot use ASSERT_* here because this function returns size_t.
+ * ASSERT_* expands to "return ..." which is ill-formed in non-void functions.
+ */
+static size_t count_allocations_on_node(TestBufferManager& bm, const NodeID node, const size_t iterations) {
+  size_t count = 0;
 
-  auto ptr = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB256));
-  // EXPECT_EQ(ptr, BufferPtr<void>(PageID{0}, 0, PageSizeType::KiB256));
+  constexpr auto alignment = PAGE_ALIGNMENT;
+  constexpr auto size_type = PageSizeType::KiB8;
+  const auto bytes = bytes_for_size_type(size_type);
 
-  // TODO: Test Sizes capcaity etc
+  for (size_t i = 0; i < iterations; ++i) {
+    void* ptr = bm.allocate(bytes, alignment);
+    EXPECT_NE(ptr, nullptr);
+    if (!ptr) {
+      break;
+    }
 
-  // TODO: If the page is deallocated, the pointer should be set to 0
-  EXPECT_NE(ptr.operator->(), nullptr);
-  buffer_manager.deallocate(ptr, bytes_for_size_type(PageSizeType::KiB256));
-  EXPECT_EQ(ptr.operator->(), nullptr);
+    const auto page_id = bm.find_page(ptr);
+    EXPECT_TRUE(page_id.valid());
+    if (!page_id.valid()) {
+      bm.deallocate(ptr, bytes, alignment);
+      break;
+    }
 
-  auto ptr2 = buffer_manager.allocate(1024);
-  // EXPECT_EQ(ptr2, BufferPtr<void>(PageID{1}, 0, PageSizeType::KiB256));
+    auto* frame = bm.frame(page_id);
+    EXPECT_NE(frame, nullptr);
+    if (!frame) {
+      bm.deallocate(ptr, bytes, alignment);
+      break;
+    }
 
-  buffer_manager.deallocate(ptr2, 1024);
-  EXPECT_NE(ptr2.operator->(), nullptr);
-  buffer_manager.deallocate(ptr2, 1024);
-  EXPECT_EQ(ptr2.operator->(), nullptr);
+    if (frame->node_id() == node) {
+      ++count;
+    }
+
+    bm.deallocate(ptr, bytes, alignment);
+  }
+
+  return count;
 }
 
-TEST_F(BufferManagerTest, TestAllocateDifferentPageSizes) {
-  auto buffer_manager = create_buffer_manager(5 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
+/**
+ * IMPORTANT:
+ * MigrationPolicy::random() uses a static thread_local generator seeded once per thread.
+ * If we run multiple policies in the same thread, later policies will NOT get their own
+ * deterministic sequences even if they have different seeds.
+ *
+ * To keep this deterministic and stable, run each policy in its own std::thread.
+ */
+static size_t count_allocations_on_node_in_fresh_thread(const std::filesystem::path& ssd_dir, const size_t pool_size,
+                                                        const MigrationPolicy& policy, const NodeID node,
+                                                        const size_t iterations) {
+  size_t result = 0;
 
-  auto current_bytes = size_t{0};
-  auto ptr8 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB8));
-  EXPECT_EQ(ptr8.get_frame()->size_type, PageSizeType::KiB8);
-  EXPECT_EQ(ptr8.get_frame()->page_type, PageType::Dram);
+  std::thread t([&]() {
+    auto bm = create_buffer_manager(ssd_dir, pool_size, policy);
+    result = count_allocations_on_node(bm, node, iterations);
+  });
 
-  current_bytes += bytes_for_size_type(PageSizeType::KiB8);
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), current_bytes);
-
-  auto ptr16 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB16));
-  EXPECT_EQ(ptr16.get_frame()->size_type, PageSizeType::KiB16);
-  EXPECT_EQ(ptr16.get_frame()->page_type, PageType::Dram);
-
-  current_bytes += bytes_for_size_type(PageSizeType::KiB16);
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), current_bytes);
-
-  auto ptr32 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB32));
-  EXPECT_EQ(ptr32.get_frame()->size_type, PageSizeType::KiB32);
-  EXPECT_EQ(ptr32.get_frame()->page_type, PageType::Dram);
-  current_bytes += bytes_for_size_type(PageSizeType::KiB32);
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), current_bytes);
-
-  auto ptr64 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB64));
-  EXPECT_EQ(ptr64.get_frame()->size_type, PageSizeType::KiB64);
-  EXPECT_EQ(ptr64.get_frame()->page_type, PageType::Dram);
-  current_bytes += bytes_for_size_type(PageSizeType::KiB64);
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), current_bytes);
-
-  auto ptr128 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB128));
-  EXPECT_EQ(ptr128.get_frame()->size_type, PageSizeType::KiB128);
-  EXPECT_EQ(ptr128.get_frame()->page_type, PageType::Dram);
-
-  current_bytes += bytes_for_size_type(PageSizeType::KiB128);
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), current_bytes);
-
-  auto ptr256 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB256));
-  EXPECT_EQ(ptr256.get_frame()->size_type, PageSizeType::KiB256);
-  EXPECT_EQ(ptr256.get_frame()->page_type, PageType::Dram);
-  current_bytes += bytes_for_size_type(PageSizeType::KiB256);
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), current_bytes);
-
-  auto ptr512 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB512));
-  EXPECT_EQ(ptr512.get_frame()->size_type, PageSizeType::KiB512);
-  EXPECT_EQ(ptr512.get_frame()->page_type, PageType::Dram);
-  current_bytes += bytes_for_size_type(PageSizeType::KiB512);
-  EXPECT_EQ(buffer_manager.dram_bytes_used(), current_bytes);
-
-  EXPECT_ANY_THROW(buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB512) + 5));
+  t.join();
+  return result;
 }
 
-// TEST_F(BufferManagerTest, TestUnswizzle) {
-//   auto buffer_manager = create_buffer_manager(bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
+static size_t count_allocations_on_dram_when_no_numa(const std::filesystem::path& ssd_dir, const size_t pool_size,
+                                                     const MigrationPolicy& policy, const size_t iterations) {
+  auto bm = create_buffer_manager_no_numa(ssd_dir, pool_size, policy);
 
-//   auto ptr1 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB32));
-//   auto [frame1, offset1] = buffer_manager.unswizzle(static_cast<char*>(ptr1.get_pointer()) + 30);
-//   EXPECT_EQ(offset1, 30);
-//   EXPECT_EQ(frame1->page_id, PageID{0});
-//   EXPECT_EQ(frame1->size_type, PageSizeType::KiB32);
-//   EXPECT_EQ(frame1->page_type, PageType::Dram);
+  constexpr auto alignment = PAGE_ALIGNMENT;
+  constexpr auto size_type = PageSizeType::KiB8;
+  const auto bytes = bytes_for_size_type(size_type);
 
-//   auto ptr2 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB64));
-//   auto [frame2, offset2] = buffer_manager.unswizzle(static_cast<char*>(ptr2.get_pointer()) + 1337);
-//   EXPECT_EQ(offset2, 1337);
-//   EXPECT_EQ(frame2->page_id, PageID{1});
-//   EXPECT_EQ(frame2->size_type, PageSizeType::KiB64);
-//   EXPECT_EQ(frame2->page_type, PageType::Dram);
-// }
+  size_t on_dram = 0;
 
-TEST_F(BufferManagerTest, TestMakeResidentDramSDDMode) {
-  auto buffer_manager = create_buffer_manager(bytes_for_size_type(MAX_PAGE_SIZE_TYPE), BufferManagerMode::DramSSD);
-  auto ptr1 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB32));
+  for (size_t i = 0; i < iterations; ++i) {
+    void* ptr = bm.allocate(bytes, alignment);
+    EXPECT_NE(ptr, nullptr);
+    if (!ptr) {
+      break;
+    }
 
-  auto frame = ptr1.get_frame();
-  EXPECT_TRUE(frame->is_resident());
-  EXPECT_EQ(frame->page_type, PageType::Dram);
-  EXPECT_FALSE(frame->is_pinned());
-  EXPECT_NE(frame->data, nullptr);
+    const auto page_id = bm.find_page(ptr);
+    EXPECT_TRUE(page_id.valid());
+    if (!page_id.valid()) {
+      bm.deallocate(ptr, bytes, alignment);
+      break;
+    }
 
-  auto frame1 = buffer_manager.make_resident(frame, AccessIntent::Read);
-  EXPECT_EQ(frame1, frame);
-  EXPECT_TRUE(frame->is_resident());
-  EXPECT_EQ(frame->page_type, PageType::Dram);
-  EXPECT_FALSE(frame->is_pinned());
-  EXPECT_TRUE(frame1->is_referenced());
+    auto* frame = bm.frame(page_id);
+    EXPECT_NE(frame, nullptr);
+    if (!frame) {
+      bm.deallocate(ptr, bytes, alignment);
+      break;
+    }
 
-  EXPECT_NE(frame->data, nullptr);
+    if (frame->node_id() == NodeID{0}) {
+      ++on_dram;
+    }
 
-  evict_frame(buffer_manager, frame);
-  EXPECT_FALSE(frame->is_resident());
+    bm.deallocate(ptr, bytes, alignment);
+  }
 
-  auto frame2 = buffer_manager.make_resident(frame, AccessIntent::Read);
-  EXPECT_EQ(frame2, frame);
-  EXPECT_EQ(frame2->page_type, PageType::Dram);
-  EXPECT_FALSE(frame->is_pinned());
-  EXPECT_TRUE(frame2->is_resident());
-  EXPECT_TRUE(frame2->is_referenced());
+  // Stronger invariant: NUMA pool must not be used when NUMA is disabled.
+  EXPECT_EQ(bm.reserved_bytes_numa_buffer_pool(), 0u);
 
-  EXPECT_NE(frame2->data, nullptr);
+  return on_dram;
 }
 
-TEST_F(BufferManagerTest, TestMakeResidentDramNumaEmulationSSDModeWithAllBypassMigrationPolicy) {
-  auto buffer_manager = create_buffer_manager(10 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE),
-                                              BufferManagerMode::DramNumaEmulationSSD, MigrationPolicy(0, 0, 0, 0));
+TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementRespectsMigrationPolicyExtremes) {
+  REQUIRE_TWO_NUMA_NODES_OR_RETURN();
 
-  // We can use a fixed access intent, since it does not have any effect on the selection, it just controls which bypass function to use.
-  constexpr auto access_intent = AccessIntent::Read;
-  constexpr auto page_id = PageID{0};
+  constexpr size_t iterations = 200;
+  const auto pool_size = 2 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE);
 
-  struct alignas(512) Page {
-    std::array<std::byte, bytes_for_size_type(MAX_PAGE_SIZE_TYPE)> data;
+  /**
+   * Important:
+   * MigrationPolicy::bypass_dram_during_write() returns:
+   *
+   *   rand > ratio
+   *
+   * Therefore:
+   *   ratio = 0.0  → always bypass DRAM
+   *   ratio = 1.0  → never bypass DRAM
+   *
+   * We do NOT assume which pool is primary vs secondary.
+   * We only assert that the two extremes behave DIFFERENTLY
+   * and deterministically.
+   */
+
+  const MigrationPolicy policy_ratio_0{/*dram_read*/ 0.0,
+                                       /*dram_write*/ 0.0,
+                                       /*numa_read*/ 0.0,
+                                       /*numa_write*/ 0.0,
+                                       /*seed*/ 42};
+
+  const MigrationPolicy policy_ratio_1{/*dram_read*/ 0.0,
+                                       /*dram_write*/ 1.0,
+                                       /*numa_read*/ 0.0,
+                                       /*numa_write*/ 0.0,
+                                       /*seed*/ 42};
+
+  const NodeID dram_node{0};
+
+  const auto r0_on_dram =
+      count_allocations_on_node_in_fresh_thread(_ssd_dir, pool_size, policy_ratio_0, dram_node, iterations);
+  const auto r1_on_dram =
+      count_allocations_on_node_in_fresh_thread(_ssd_dir, pool_size, policy_ratio_1, dram_node, iterations);
+
+  // Extremes must differ
+  EXPECT_NE(r0_on_dram, r1_on_dram) << "dram_write_ratio=0 and 1 should result in opposite allocation behavior";
+
+  // Each extreme must be deterministic (all allocations end up on one node)
+  EXPECT_TRUE(r0_on_dram == 0 || r0_on_dram == iterations)
+      << "dram_write_ratio=0 should produce deterministic placement, got on_dram=" << r0_on_dram;
+
+  EXPECT_TRUE(r1_on_dram == 0 || r1_on_dram == iterations)
+      << "dram_write_ratio=1 should produce deterministic placement, got on_dram=" << r1_on_dram;
+}
+
+TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementVariesWithIntermediateDramWriteRatios) {
+  REQUIRE_TWO_NUMA_NODES_OR_RETURN();
+
+  // Use a few more iterations so that intermediate ratios have a good chance to yield both outcomes.
+  constexpr size_t iterations = 1000;
+  const auto pool_size = 2 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE);
+
+  const NodeID dram_node{0};
+
+  // Keep other ratios at 0 so we primarily test the dram_write knob.
+  // Use different seeds so we don't accidentally test the same RNG sequence pattern.
+  const auto run = [&](const double dram_write_ratio, const int64_t seed) {
+    const MigrationPolicy policy{/*dram_read*/ 0.0,
+                                 /*dram_write*/ dram_write_ratio,
+                                 /*numa_read*/ 0.0,
+                                 /*numa_write*/ 0.0,
+                                 /*seed*/ seed};
+    return count_allocations_on_node_in_fresh_thread(_ssd_dir, pool_size, policy, dram_node, iterations);
   };
 
-  auto dram_page = Page{};
-  auto numa_page = Page{};
+  const auto on_dram_r10 = run(1.0, 101);
+  const auto on_dram_r75 = run(0.75, 102);
+  const auto on_dram_r50 = run(0.50, 103);
+  const auto on_dram_r25 = run(0.25, 104);
+  const auto on_dram_r00 = run(0.0, 105);
 
-  // Allocate a random to ensure that we have the page id created. We just use manually created frames to test different scenarios
-  auto ptr1 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB32));
-  EXPECT_EQ(ptr1.get_frame()->page_id, page_id);
-  // TODO: Write some data to the page for testin
-  // TODO: Mock ssd region
+  // Extremes should be deterministic.
+  EXPECT_TRUE(on_dram_r00 == 0 || on_dram_r00 == iterations)
+      << "dram_write_ratio=0 expected deterministic placement, got on_dram=" << on_dram_r00;
 
-  // If the frame is a DRAM frame and resident, it should return the DRAM frame returned
-  {
-    auto frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    frame->set_resident();
-    auto resident_frame = buffer_manager.make_resident(frame, access_intent);
-    EXPECT_EQ(frame, resident_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
+  EXPECT_TRUE(on_dram_r10 == 0 || on_dram_r10 == iterations)
+      << "dram_write_ratio=1 expected deterministic placement, got on_dram=" << on_dram_r10;
 
-  //If the frame is a DRAM frame and has a resident NUMA frame assigned, it should return the DRAM frame
-  {
-    auto dram_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    auto numa_frame = dram_frame->clone_and_attach_sibling<PageType::Numa>();
-
-    numa_frame->set_resident();
-    dram_frame->set_resident();
-
-    auto resident_frame = buffer_manager.make_resident(dram_frame, access_intent);
-    EXPECT_EQ(dram_frame, resident_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-
-  // If the frame is a NUMA frame and has a resident DRAM frame assigned, it should return the DRAM frame
-  {
-    auto dram_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    auto numa_frame = dram_frame->clone_and_attach_sibling<PageType::Numa>();
-    numa_frame->data = numa_page.data.data();
-
-    numa_frame->set_resident();
-    dram_frame->set_resident();
-
-    auto resident_frame = buffer_manager.make_resident(numa_frame, access_intent);
-    EXPECT_EQ(dram_frame, resident_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-
-  // If the frame is a NUMA frame and has no resident DRAM frame assigned, it should return NUMA frame, since we do not want to bypass it
-  {
-    auto numa_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Numa, numa_page.data.data());
-    numa_frame->data = numa_page.data.data();
-    numa_frame->set_resident();
-
-    auto resident_frame = buffer_manager.make_resident(numa_frame, access_intent);
-    EXPECT_EQ(resident_frame, numa_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-
-  // Pass a DRAM frame with a Numa frame attached, but both frames are not resident
-  {
-    auto dram_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    auto numa_frame = dram_frame->clone_and_attach_sibling<PageType::Numa>();
-    dram_frame->set_evicted();
-    numa_frame->set_evicted();
-
-    auto resident_frame = buffer_manager.make_resident(dram_frame, access_intent);
-    EXPECT_EQ(resident_frame, dram_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-
-  // Pass a NUMA frame with a DRAM frame attached, but both frames are not resident
-  {
-    auto dram_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    auto numa_frame = dram_frame->clone_and_attach_sibling<PageType::Numa>();
-    dram_frame->set_evicted();
-    numa_frame->set_evicted();
-
-    auto resident_frame = buffer_manager.make_resident(numa_frame, access_intent);
-    EXPECT_EQ(resident_frame, dram_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-}
-
-TEST_F(BufferManagerTest, TestMakeResidentDramNumaEmulationSSDModeWithNoBypassMigrationPolicy) {
-  auto buffer_manager = create_buffer_manager(10 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE),
-                                              BufferManagerMode::DramNumaEmulationSSD, MigrationPolicy(1, 1, 1, 1));
-
-  // We can use a fixed access intent, since it does not have any effect on the selection, it just controls which bypass function to use.
-  constexpr auto access_intent = AccessIntent::Read;
-  constexpr auto page_id = PageID{0};
-
-  struct alignas(512) Page {
-    std::array<std::byte, bytes_for_size_type(MAX_PAGE_SIZE_TYPE)> data;
+  // Intermediate ratios should be mixed.
+  const auto expect_mixed = [&](const double ratio, const size_t on_dram) {
+    EXPECT_GT(on_dram, 0u) << "dram_write_ratio=" << ratio << " should sometimes place on DRAM";
+    EXPECT_LT(on_dram, iterations) << "dram_write_ratio=" << ratio << " should sometimes place off-DRAM";
   };
 
-  auto dram_page = Page{};
-  auto numa_page = Page{};
+  expect_mixed(0.25, on_dram_r25);
+  expect_mixed(0.50, on_dram_r50);
+  expect_mixed(0.75, on_dram_r75);
 
-  // Allocate a random to ensure that we have the page id created. We just use manually created frames to test different scenarios
-  auto ptr1 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB32));
-  EXPECT_EQ(ptr1.get_frame()->page_id, page_id);
-  // TODO: Write some data to the page for testin
-  // TODO: Mock ssd region
-
-  // If the frame is a DRAM frame and resident, it should return the DRAM frame returned
-  {
-    auto frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    frame->set_resident();
-    auto resident_frame = buffer_manager.make_resident(frame, access_intent);
-    EXPECT_EQ(frame, resident_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-
-  //If the frame is a DRAM frame and has a resident NUMA frame assigned, it should return the DRAM frame
-  {
-    auto dram_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    auto numa_frame = dram_frame->clone_and_attach_sibling<PageType::Numa>();
-
-    numa_frame->set_resident();
-    dram_frame->set_resident();
-
-    auto resident_frame = buffer_manager.make_resident(dram_frame, access_intent);
-    EXPECT_EQ(dram_frame, resident_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-
-  // If the frame is a NUMA frame and has a resident DRAM frame assigned, it should return the DRAM frame
-  {
-    auto dram_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    auto numa_frame = dram_frame->clone_and_attach_sibling<PageType::Numa>();
-    numa_frame->data = numa_page.data.data();
-
-    numa_frame->set_resident();
-    dram_frame->set_resident();
-
-    auto resident_frame = buffer_manager.make_resident(numa_frame, access_intent);
-    EXPECT_EQ(dram_frame, resident_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-
-  // If the frame is a NUMA frame and has no resident DRAM frame assigned, it should return DRAM frame
-  {
-    auto numa_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Numa, numa_page.data.data());
-    numa_frame->data = numa_page.data.data();
-    numa_frame->set_resident();
-
-    auto resident_frame = buffer_manager.make_resident(numa_frame, access_intent);
-    EXPECT_NE(resident_frame, numa_frame);
-    EXPECT_EQ(resident_frame->page_type, PageType::Dram);
-
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-
-  // Pass a DRAM frame with a Numa frame attached, but both frames are not resident
-  {
-    auto dram_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    auto numa_frame = dram_frame->clone_and_attach_sibling<PageType::Numa>();
-    dram_frame->set_evicted();
-    numa_frame->set_evicted();
-
-    auto resident_frame = buffer_manager.make_resident(dram_frame, access_intent);
-    EXPECT_EQ(resident_frame, dram_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-
-  // Pass a NUMA frame with a DRAM frame attached, but both frames are not resident
-  {
-    auto dram_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    auto numa_frame = dram_frame->clone_and_attach_sibling<PageType::Numa>();
-    dram_frame->set_evicted();
-    numa_frame->set_evicted();
-
-    auto resident_frame = buffer_manager.make_resident(numa_frame, access_intent);
-    EXPECT_EQ(resident_frame, dram_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
+  // Monotonic trend: larger ratio should yield >= number of allocations on DRAM.
+  EXPECT_LE(on_dram_r00, on_dram_r25);
+  EXPECT_LE(on_dram_r25, on_dram_r50);
+  EXPECT_LE(on_dram_r50, on_dram_r75);
+  EXPECT_LE(on_dram_r75, on_dram_r10);
 }
 
-TEST_F(BufferManagerTest, TestMakeResidentDramNumaEmulationSSDModeWithNoBypassNumaAndAllBypassDramMigrationPolicy) {
-  auto buffer_manager = create_buffer_manager(10 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE),
-                                              BufferManagerMode::DramNumaEmulationSSD, MigrationPolicy(0, 0, 1, 1));
+TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementWithoutNumaAlwaysUsesDram) {
+  // This test intentionally does NOT require real NUMA support.
+  // It verifies that in DRAM+SSD mode (NUMA disabled), allocations always use DRAM
+  // regardless of MigrationPolicy ratios.
 
-  // We can use a fixed access intent, since it does not have any effect on the selection, it just controls which bypass function to use.
-  constexpr auto access_intent = AccessIntent::Read;
-  constexpr auto page_id = PageID{0};
+  constexpr size_t iterations = 500;
+  const auto pool_size = 2 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE);
 
-  struct alignas(512) Page {
-    std::array<std::byte, bytes_for_size_type(MAX_PAGE_SIZE_TYPE)> data;
-  };
+  const MigrationPolicy policy_ratio_0{/*dram_read*/ 0.0,
+                                       /*dram_write*/ 0.0,
+                                       /*numa_read*/ 0.0,
+                                       /*numa_write*/ 0.0,
+                                       /*seed*/ 42};
 
-  auto dram_page = Page{};
-  auto numa_page = Page{};
+  const MigrationPolicy policy_ratio_1{/*dram_read*/ 0.0,
+                                       /*dram_write*/ 1.0,
+                                       /*numa_read*/ 0.0,
+                                       /*numa_write*/ 0.0,
+                                       /*seed*/ 42};
 
-  // Allocate a random to ensure that we have the page id created. We just use manually created frames to test different scenarios
-  auto ptr1 = buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB32));
-  EXPECT_EQ(ptr1.get_frame()->page_id, page_id);
-  // TODO: Write some data to the page for testin
-  // TODO: Mock ssd region
+  const auto r0_on_dram = count_allocations_on_dram_when_no_numa(_ssd_dir, pool_size, policy_ratio_0, iterations);
+  const auto r1_on_dram = count_allocations_on_dram_when_no_numa(_ssd_dir, pool_size, policy_ratio_1, iterations);
 
-  {
-    auto dram_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    dram_frame->set_evicted();
-
-    auto resident_frame = buffer_manager.make_resident(dram_frame, access_intent);
-    EXPECT_NE(dram_frame, resident_frame);
-    EXPECT_EQ(resident_frame->page_type, PageType::Numa);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-
-  // If the frame is a DRAM frame and resident, it should return the DRAM frame returned
-  {
-    auto dram_frame = make_frame(page_id, PageSizeType::KiB32, PageType::Dram, dram_page.data.data());
-    auto numa_frame = dram_frame->clone_and_attach_sibling<PageType::Numa>();
-    dram_frame->set_evicted();
-    numa_frame->set_evicted();
-
-    auto resident_frame = buffer_manager.make_resident(dram_frame, access_intent);
-    EXPECT_EQ(numa_frame, resident_frame);
-    EXPECT_TRUE(resident_frame->is_resident());
-    EXPECT_FALSE(resident_frame->is_pinned());
-    EXPECT_TRUE(resident_frame->is_referenced());
-  }
-}
-
-TEST_F(BufferManagerTest, TestAllocateAndDeallocateWithDramNumaEmulationSSDModeWithMigrationPolicy) {
-  constexpr auto iterations = size_t{100};
-
-  {
-    // Check that that a around 1 percent (2/100 iterations) number of pages are allocated on dram
-    constexpr size_t lazy_seed = 126378163;
-    auto lazy_buffer_manager =
-        create_buffer_manager(5 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE), BufferManagerMode::DramNumaEmulationSSD,
-                              LazyMigrationPolicy(lazy_seed));
-
-    auto lazy_dram_frame_count = size_t{0};
-    for (auto i = size_t{0}; i < iterations; ++i) {
-      auto ptr = lazy_buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB8));
-      auto frame = ptr.get_frame();
-      EXPECT_TRUE(frame->is_resident());
-      lazy_dram_frame_count += frame->page_type == PageType::Dram;
-      lazy_buffer_manager.deallocate(ptr, bytes_for_size_type(PageSizeType::KiB8));
-    }
-
-    EXPECT_EQ(lazy_dram_frame_count, 2);
-  }
-  {
-    // Check that that a around 34 percent (32/100 iterations) number of pages are allocated on dram
-    constexpr size_t custom_seed = 6999293;
-
-    auto custom_policy_buffer_manager =
-        create_buffer_manager(5 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE), BufferManagerMode::DramNumaEmulationSSD,
-                              MigrationPolicy(0.34, 0.34, 0.34, 0.34, custom_seed));
-    auto custom_policy_dram_frame_count = size_t{0};
-    for (auto i = size_t{0}; i < iterations; ++i) {
-      auto ptr = custom_policy_buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB8));
-      auto frame = ptr.get_frame();
-      EXPECT_TRUE(frame->is_resident());
-      custom_policy_dram_frame_count += frame->page_type == PageType::Dram;
-      custom_policy_buffer_manager.deallocate(ptr, bytes_for_size_type(PageSizeType::KiB8));
-    }
-
-    EXPECT_EQ(custom_policy_dram_frame_count, 32);
-  }
-  {
-    // Check that that a around 100 percent (100/100 iterations) number of pages are allocated on dram
-    constexpr size_t eager_seed = 19595012;
-
-    auto eager_buffer_manager =
-        create_buffer_manager(5 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE), BufferManagerMode::DramNumaEmulationSSD,
-                              EagerMigrationPolicy(eager_seed));
-    auto eager_dram_frame_count = size_t{0};
-    for (auto i = size_t{0}; i < iterations; ++i) {
-      auto ptr = eager_buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB8));
-      auto frame = ptr.get_frame();
-      EXPECT_TRUE(frame->is_resident());
-      eager_dram_frame_count += frame->page_type == PageType::Dram;
-      eager_buffer_manager.deallocate(ptr, bytes_for_size_type(PageSizeType::KiB8));
-    }
-
-    EXPECT_EQ(eager_dram_frame_count, 100);
-  }
-}
-
-TEST_F(BufferManagerTest, TestAllocateAndDeallocateWithDramSSDMode) {
-  GTEST_SKIP();
-}
-
-TEST_F(BufferManagerTest, TestFindFrameAndOffset) {
-  // TODO: test with numa, too
-  auto buffer_manager = create_buffer_manager(5 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE), BufferManagerMode::DramSSD);
-
-  auto ptr1 = static_cast<BufferPtr<int>>(buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB8))) + 50;
-  auto [frame1, offset1] = buffer_manager.find_frame_and_offset(ptr1.operator->());
-  EXPECT_EQ(frame1, ptr1.get_frame());
-  EXPECT_EQ(offset1, 50 * sizeof(int));
-
-  auto ptr2 = static_cast<BufferPtr<int>>(buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB8))) + 1337;
-  auto [frame2, offset2] = buffer_manager.find_frame_and_offset(ptr2.operator->());
-  EXPECT_EQ(frame2, ptr2.get_frame());
-  EXPECT_EQ(offset2, 1337 * sizeof(int));
-
-  auto ptr3 = static_cast<BufferPtr<int>>(buffer_manager.allocate(bytes_for_size_type(PageSizeType::KiB256))) + 0;
-  auto [frame3, offset3] = buffer_manager.find_frame_and_offset(ptr3.operator->());
-  EXPECT_EQ(frame3, ptr3.get_frame());
-  EXPECT_EQ(offset3, 0);
-
-  int test_var = 10;
-  auto [outside_frame, outside_offset] = buffer_manager.find_frame_and_offset(std::addressof(test_var));
-  EXPECT_EQ(outside_frame, &(buffer_manager.DUMMY_FRAME));
-  EXPECT_EQ(outside_offset, 0);
-}
-
-TEST_F(BufferManagerTest, TestMultipleAllocationsAndDeallocations) {
-  constexpr auto iterations = size_t{1000};
-  constexpr auto vector_size = size_t{8192};
-  Hyrise::get().buffer_manager =
-      create_buffer_manager(bytes_for_size_type(MAX_PAGE_SIZE_TYPE), BufferManagerMode::DramSSD);
-  auto vectors = std::vector<std::shared_ptr<pmr_vector<int32_t>>>{};
-
-  for (auto i = 0; i < iterations; ++i) {
-    auto allocator = PolymorphicAllocator<size_t>{get_buffer_manager_memory_resource()};
-    auto pin_guard = AllocatorPinGuard{allocator};
-    auto vector = pmr_vector<int32_t>(vector_size, allocator);
-    std::fill(vector.begin(), vector.end(), i);
-    vectors.emplace_back(std::make_shared<pmr_vector<int32_t>>(std::move(vector)));
-  }
-
-  for (auto i = 0; i < iterations; ++i) {
-    ReadPinGuard pin_guard{*vectors[i]};
-    auto& vector = *vectors[i];
-    for (auto j = 0; j < vector_size; ++j) {
-      EXPECT_EQ(vector[j], i);
-    }
-  }
-
-  for (size_t i = iterations - 1; i > 0; --i) {
-    ReadPinGuard pin_guard{*vectors[i]};
-    auto& vector = *vectors[i];
-    for (auto j = 0; j < vector_size; ++j) {
-      EXPECT_EQ(vector[j], i);
-    }
-  }
-
-  for (auto i = 0; i < iterations; ++i) {
-    WritePinGuard pin_guard{*vectors[i]};
-    vectors[i] = nullptr;
-  }
-}
-
-TEST_F(BufferManagerTest, TestMultipleAllocationsAndDeallocationsStrings) {
-  constexpr auto iterations = size_t{1000};
-  constexpr auto vector_size = size_t{8192};
-  Hyrise::get().buffer_manager =
-      create_buffer_manager(2 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE), BufferManagerMode::DramSSD);
-  auto vectors = std::vector<std::shared_ptr<pmr_vector<pmr_string>>>{};
-  auto buffer_resource = MonotonicBufferResource{get_buffer_manager_memory_resource()};
-
-  for (auto i = 0; i < iterations; ++i) {
-    auto allocator = PolymorphicAllocator<size_t>{&buffer_resource};
-    auto pin_guard = AllocatorPinGuard{allocator};
-    auto vector = pmr_vector<pmr_string>(vector_size, allocator);
-    if (i > iterations / 2) {
-      std::fill(vector.begin(), vector.end(), boost::lexical_cast<pmr_string>(i));
-    } else {
-      std::fill(vector.begin(), vector.end(),
-                std::move(boost::lexical_cast<pmr_string>(i) + "add some padding to create along string"));
-    }
-    vectors.emplace_back(std::make_shared<pmr_vector<pmr_string>>(std::move(vector)));
-  }
-
-  for (auto i = 0; i < iterations; ++i) {
-    ReadPinGuard pin_guard{*vectors[i]};
-    auto& vector = *vectors[i];
-    for (auto j = 0; j < vector_size; ++j) {
-      EXPECT_EQ(vector[j], boost::lexical_cast<pmr_string>(i));
-    }
-  }
-
-  for (size_t i = iterations - 1; i > 0; --i) {
-    ReadPinGuard pin_guard{*vectors[i]};
-    auto& vector = *vectors[i];
-    for (auto j = 0; j < vector_size; ++j) {
-      EXPECT_EQ(vector[j], boost::lexical_cast<pmr_string>(i));
-    }
-  }
-
-  for (auto i = 0; i < iterations; ++i) {
-    WritePinGuard pin_guard{*vectors[i]};
-    vectors[i] = nullptr;
-  }
-}
-
-TEST_F(BufferManagerTest, TestVectorBeginEnd) {
-  // auto allocator = PolymorphicAllocator<size_t>{get_buffer_manager_memory_resource()};
-  // // 8192 * 4 == Page32KB
-  // auto vector = pmr_vector<int32_t>(8192, allocator);
-  // auto begin = vector.begin();
-  // auto end = vector.end();
-
-  // auto begin_ptr = begin.get_ptr().operator->();
-  // auto end_ptr = end.get_ptr().operator->();
-
-  // auto begin_ptr2 = BufferPtr<int32_t>(begin_ptr);
-  // auto end_ptr2 = BufferPtr<int32_t>(end_ptr);
-
-  // std::sort(begin_ptr2, end_ptr2);
-  // EXPECT_NE(begin_ptr2, end_ptr2);
+  EXPECT_EQ(r0_on_dram, iterations);
+  EXPECT_EQ(r1_on_dram, iterations);
 }
 
 }  // namespace hyrise

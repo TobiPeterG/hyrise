@@ -231,8 +231,27 @@ void BufferPool::evict(EvictionItem& item, Frame* frame) {
   // If this fails, we retry and some point, we might land on SSD.
   for (auto repeat = size_t{0}; repeat < MAX_REPEAT_COUNT; ++repeat) {
     // If we have a target buffer pool and we don't want to bypass it, we move the page to the other pool
-    const auto write_to_ssd =
+    auto write_to_ssd =
         !target_buffer_pool || !target_buffer_pool->enabled || migration_policy.bypass_numa_during_write();
+
+#if HYRISE_NUMA_SUPPORT
+    // If we intend to migrate to another NUMA node, make sure NUMA is available at runtime and the node exists.
+    if (!write_to_ssd) {
+      if (numa_available() < 0) {
+        write_to_ssd = true;
+      } else {
+        const auto max_node = numa_max_node();
+        if (static_cast<int>(target_buffer_pool->node_id) > max_node) {
+          write_to_ssd = true;
+        }
+      }
+    }
+#else
+    // Built without NUMA support -> never try to migrate to another node
+    if (!write_to_ssd) {
+      write_to_ssd = true;
+    }
+#endif
 
     if (write_to_ssd) {
       // Otherwise we just write the page if its dirty and free the associated pages

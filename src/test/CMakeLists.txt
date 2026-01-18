@@ -180,7 +180,7 @@ set(
     # lib/storage/buffer/buffer_ptr_test.cpp
     lib/storage/buffer/buffer_manager_stress_test.cpp
     # lib/storage/buffer/memory_resource_test.cpp
-    # lib/storage/buffer/buffer_manager_test.cpp
+    lib/storage/buffer/buffer_manager_test.cpp
     # lib/storage/buffer/frame_test.cpp
     # lib/storage/buffer/hybrid_latch_test.cpp
     # lib/storage/buffer/migration_policy_test.cpp

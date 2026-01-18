@@ -8,13 +8,17 @@
 #include <atomic>
 #endif
 #include <fstream>
+#include <iostream>
 #include <utility>
 #include "hyrise.hpp"
-#include <iostream>
 #include "storage/buffer/jemalloc_resource.hpp"
 #include "storage/buffer/ssd_region.hpp"
 #include "storage/buffer/volatile_region.hpp"
 #include "utils/assert.hpp"
+
+#if HYRISE_NUMA_SUPPORT
+#include <numa.h>
+#endif
 
 #ifndef NDEBUG
 #include <fstream>
@@ -69,10 +73,8 @@ struct LivePageKeyEq {
 std::unordered_set<LivePageKey, LivePageKeyHash, LivePageKeyEq> s_live_pages;
 
 static LivePageKey live_page_key(const PageID& page_id) {
-  return LivePageKey{
-      s_mapping_epoch.load(std::memory_order_relaxed),
-      static_cast<uint8_t>(page_id._size_type),
-      static_cast<uint64_t>(page_id.index)};
+  return LivePageKey{s_mapping_epoch.load(std::memory_order_relaxed), static_cast<uint8_t>(page_id._size_type),
+                     static_cast<uint64_t>(page_id.index)};
 }
 }  // namespace
 #endif
@@ -152,15 +154,56 @@ BufferManager::BufferManager(const Config config)
       _primary_buffer_pool(std::make_shared<BufferPool>(
           true, config.dram_buffer_pool_size, config.enable_eviction_purge_worker, _volatile_regions,
           config.migration_policy, _ssd_region, nullptr, config.cpu_node, _metrics->dram_buffer_pool_metrics)),
-      _secondary_buffer_pool(std::make_shared<BufferPool>(
-          config.enable_numa, config.numa_buffer_pool_size, config.enable_eviction_purge_worker, _volatile_regions,
-          config.migration_policy, _ssd_region, _primary_buffer_pool, config.memory_node,
-          _metrics->numa_buffer_pool_metrics)) {
+      _secondary_buffer_pool(std::make_shared<BufferPool>(config.enable_numa, config.numa_buffer_pool_size,
+                                                          config.enable_eviction_purge_worker, _volatile_regions,
+                                                          config.migration_policy, _ssd_region, _primary_buffer_pool,
+                                                          config.memory_node, _metrics->numa_buffer_pool_metrics)) {
 #ifndef NDEBUG
   bump_mapping_epoch();
 #endif
 
   if (config.enable_numa) {
+#if HYRISE_NUMA_SUPPORT
+    if (numa_available() < 0) {
+      Fail("BufferManager configured with enable_numa=true, but NUMA is not available on this system.");
+    }
+
+    const auto max_node = numa_max_node();
+    if (max_node < 1) {
+#ifndef NDEBUG
+      {
+        void* addrs[64];
+        const auto n = ::backtrace(addrs, 64);
+        char** syms = ::backtrace_symbols(addrs, n);
+        std::cerr << "[BM] enable_numa=true but numa_max_node=" << max_node << " -- constructor backtrace:\n";
+        if (syms) {
+          for (int i = 0; i < n; ++i)
+            std::cerr << "  " << syms[i] << "\n";
+          std::free(syms);
+        }
+      }
+#endif
+      Fail(
+          "BufferManager configured with enable_numa=true, but system has fewer than 2 NUMA nodes "
+          "(need nodes 0 and 1). numa_max_node=" +
+          std::to_string(max_node));
+    }
+
+    if (static_cast<int>(config.cpu_node) > max_node) {
+      Fail("BufferManager configured with enable_numa=true, but cpu_node=" + std::to_string(config.cpu_node) +
+           " does not exist. numa_max_node=" + std::to_string(max_node));
+    }
+
+    if (static_cast<int>(config.memory_node) > max_node) {
+      Fail("BufferManager configured with enable_numa=true, but memory_node=" + std::to_string(config.memory_node) +
+           " does not exist. numa_max_node=" + std::to_string(max_node));
+    }
+#else
+    Fail(
+        "BufferManager configured with enable_numa=true, but Hyrise was built without NUMA support "
+        "(HYRISE_NUMA_SUPPORT=0).");
+#endif
+
     Assert(config.cpu_node != config.memory_node, "CPU and memory node must be different when NUMA is enabled");
   } else {
     Assert(config.cpu_node == config.memory_node, "CPU and memory node must be identical when NUMA is disabled");
@@ -250,8 +293,7 @@ void BufferManager::_dump_tracked_allocations() const {
 
   size_t i = 0;
   for (const auto& [ptr, rec] : _allocations_by_ptr) {
-    std::cerr << "[BM]  leak[" << i++ << "] ptr=" << ptr
-              << " requested_bytes=" << rec.requested_bytes
+    std::cerr << "[BM]  leak[" << i++ << "] ptr=" << ptr << " requested_bytes=" << rec.requested_bytes
               << " page_id=" << rec.page_id << "\n";
 
     if (!rec.backtrace_addrs.empty()) {
@@ -282,15 +324,18 @@ static std::string _prot_of_addr(void* addr) {
     // format: start-end perms offset dev inode pathname
     std::istringstream iss(line);
     std::string range, perms;
-    if (!(iss >> range >> perms)) continue;
+    if (!(iss >> range >> perms))
+      continue;
 
     auto dash = range.find('-');
-    if (dash == std::string::npos) continue;
+    if (dash == std::string::npos)
+      continue;
 
     auto start = std::stoull(range.substr(0, dash), nullptr, 16);
-    auto end   = std::stoull(range.substr(dash + 1), nullptr, 16);
+    auto end = std::stoull(range.substr(dash + 1), nullptr, 16);
 
-    if (a >= start && a < end) return perms;   // e.g. "rw-p" or "---p"
+    if (a >= start && a < end)
+      return perms;  // e.g. "rw-p" or "---p"
   }
   return "<not-mapped>";
 }
@@ -357,7 +402,11 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
           yield(repeat);
           continue;
         }
-        region->mbind_to_numa_node(page_id, _primary_buffer_pool->node_id);
+
+        // Only perform NUMA syscalls when NUMA is enabled at runtime.
+        if (_secondary_buffer_pool->enabled) {
+          region->mbind_to_numa_node(page_id, _primary_buffer_pool->node_id);
+        }
 
         // Required
         frame->set_node_id(_primary_buffer_pool->node_id);
@@ -369,7 +418,11 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
           yield(repeat);
           continue;
         }
-        region->mbind_to_numa_node(page_id, _secondary_buffer_pool->node_id);
+
+        // Only perform NUMA syscalls when NUMA is enabled at runtime.
+        if (_secondary_buffer_pool->enabled) {
+          region->mbind_to_numa_node(page_id, _secondary_buffer_pool->node_id);
+        }
 
         // Required
         frame->set_node_id(_secondary_buffer_pool->node_id);
@@ -401,7 +454,11 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
         continue;
       }
       _secondary_buffer_pool->free_bytes(bytes_for_size_type(page_id.size_type()));
-      region->mbind_to_numa_node(page_id, _primary_buffer_pool->node_id);
+
+      // Only perform NUMA syscalls when NUMA is enabled at runtime.
+      if (_secondary_buffer_pool->enabled) {
+        region->mbind_to_numa_node(page_id, _primary_buffer_pool->node_id);
+      }
 
       // Required: page is now on DRAM (prevents wrong refunds / double refunds later)
       frame->set_node_id(_primary_buffer_pool->node_id);
@@ -627,7 +684,10 @@ void* BufferManager::do_allocate(std::size_t bytes, std::size_t alignment) {
       continue;
     }
 
-    region->mbind_to_numa_node(page_id, buffer_pool->node_id);
+    // Only perform NUMA syscalls when NUMA is enabled at runtime.
+    if (_secondary_buffer_pool && _secondary_buffer_pool->enabled) {
+      region->mbind_to_numa_node(page_id, buffer_pool->node_id);
+    }
 
     // Required: make accounting and deallocation consistent
     frame->set_node_id(buffer_pool->node_id);
@@ -673,30 +733,28 @@ void BufferManager::do_deallocate(void* p, std::size_t bytes, std::size_t alignm
   }
 
 #ifndef NDEBUG
-{
-  std::lock_guard<std::mutex> lock(s_live_pages_mutex);
-  const auto key = live_page_key(page_id);
+  {
+    std::lock_guard<std::mutex> lock(s_live_pages_mutex);
+    const auto key = live_page_key(page_id);
 
-  if (s_live_pages.erase(key) == 0) {
-    // If we're deallocating exactly the base of a BM page with the full page size,
-    // this can happen during reset/drain of deferred frees (jemalloc extent hooks)
-    // or after mapping-epoch changes. Treat as non-fatal in debug.
-    const auto expected_base = page_base_ptr(page_id);
-    const auto expected_size = bytes_for_size_type(page_id.size_type());
+    if (s_live_pages.erase(key) == 0) {
+      // If we're deallocating exactly the base of a BM page with the full page size,
+      // this can happen during reset/drain of deferred frees (jemalloc extent hooks)
+      // or after mapping-epoch changes. Treat as non-fatal in debug.
+      const auto expected_base = page_base_ptr(page_id);
+      const auto expected_size = bytes_for_size_type(page_id.size_type());
 
-    if (p == expected_base && bytes == expected_size) {
-      std::cerr << "[BM] WARNING: do_deallocate saw untracked page-base free (likely deferred/reset). "
-                << "page_id=" << page_id << " ptr=" << p << " bytes=" << bytes << "\n";
-    } else {
-      std::ostringstream oss;
-      oss << "BufferManager::do_deallocate detected double-free or invalid free for page_id="
-          << page_id
-          << " ptr=" << p
-          << " bytes_arg=" << bytes;
-      Fail(oss.str());
+      if (p == expected_base && bytes == expected_size) {
+        std::cerr << "[BM] WARNING: do_deallocate saw untracked page-base free (likely deferred/reset). "
+                  << "page_id=" << page_id << " ptr=" << p << " bytes=" << bytes << "\n";
+      } else {
+        std::ostringstream oss;
+        oss << "BufferManager::do_deallocate detected double-free or invalid free for page_id=" << page_id
+            << " ptr=" << p << " bytes_arg=" << bytes;
+        Fail(oss.str());
+      }
     }
   }
-}
 #endif
 
   auto region = get_region(page_id);
@@ -715,10 +773,9 @@ void BufferManager::do_deallocate(void* p, std::size_t bytes, std::size_t alignm
 
   // pmr::memory_resource::deallocate() is called with the originally requested size, not necessarily the backing size.
   // We allocate whole pages, so the deallocation size may be smaller than the page size.
-  DebugAssert(bytes <= num_bytes,
-              "do_deallocate size mismatch: arg bytes=" + std::to_string(bytes) +
-              " but page size=" + std::to_string(num_bytes) +
-              " size_type=" + std::string(magic_enum::enum_name(page_id.size_type())));
+  DebugAssert(bytes <= num_bytes, "do_deallocate size mismatch: arg bytes=" + std::to_string(bytes) +
+                                      " but page size=" + std::to_string(num_bytes) +
+                                      " size_type=" + std::string(magic_enum::enum_name(page_id.size_type())));
 
   if (frame->node_id() == _primary_buffer_pool->node_id) {
     _primary_buffer_pool->free_bytes(num_bytes);
@@ -773,7 +830,8 @@ std::byte* BufferManager::page_base_ptr(const PageID page_id) const {
   DebugAssert(page_id.valid(), "Invalid page id");
   DebugAssert(_mapped_region != nullptr, "BufferManager mapping not initialized");
 
-  const auto region_idx = static_cast<size_t>(page_id.size_type()); // relies on enum order matching regions (as in find_page)
+  const auto region_idx =
+      static_cast<size_t>(page_id.size_type());  // relies on enum order matching regions (as in find_page)
   const auto page_size = bytes_for_size_type(page_id.size_type());
 
   const auto region_base = _mapped_region + region_idx * DEFAULT_RESERVED_VIRTUAL_MEMORY_PER_REGION;
