@@ -1,184 +1,215 @@
+#include <cstddef>
+#include <cstring>
 #include <memory>
 
 #include "base_test.hpp"
 
-#include <filesystem>
+#include "storage/buffer/helper.hpp"
+#include "storage/buffer/metrics.hpp"
 #include "storage/buffer/volatile_region.hpp"
 #include "types.hpp"
 
-#ifdef __APPLE__
-#include <mach/mach.h>
-#include <sys/mman.h>
-#include <sys/sysctl.h>
-#include <unistd.h>
+#if HYRISE_NUMA_SUPPORT
+#include <numa.h>
 #endif
 
 namespace hyrise {
 
 class VolatileRegionTest : public BaseTest {};
 
-TEST_F(VolatileRegionTest, TestAllocateDeallocate) {
-  auto size_type = PageSizeType::KiB32;
+namespace {
 
-  auto volatile_region = VolatileRegion(size_type, PageType::Dram, bytes_for_size_type(size_type) * 3 + 10);
+struct RegionContext {
+  std::byte* mapped_region{};
+  std::shared_ptr<BufferManagerMetrics> metrics;
+  std::array<std::shared_ptr<VolatileRegion>, NUM_PAGE_SIZE_TYPES> regions;
 
-  EXPECT_EQ(volatile_region.useable_bytes(), bytes_for_size_type(size_type) * 3);
+  explicit RegionContext() : mapped_region(create_mapped_region()), metrics(std::make_shared<BufferManagerMetrics>()) {
+    regions = create_volatile_regions(mapped_region, metrics);
+  }
 
-  // Allocate three
-  auto frame_1 = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  EXPECT_EQ(frame_1->data, nullptr);
-  volatile_region.allocate(frame_1);
-  EXPECT_NE(frame_1->data, nullptr);
-  EXPECT_NO_THROW(memset(frame_1->data, 1, bytes_for_size_type(size_type)));
-
-  auto frame_2 = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  EXPECT_EQ(frame_2->data, nullptr);
-  volatile_region.allocate(frame_2);
-  EXPECT_NE(frame_2->data, nullptr);
-  EXPECT_NE(frame_1->data, frame_2->data);
-  EXPECT_NO_THROW(memset(frame_2->data, 1, bytes_for_size_type(size_type)));
-
-  auto frame_3 = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  EXPECT_EQ(frame_3->data, nullptr);
-  volatile_region.allocate(frame_3);
-  EXPECT_NE(frame_3->data, nullptr);
-  EXPECT_NE(frame_3->data, frame_1->data);
-  EXPECT_NE(frame_3->data, frame_2->data);
-  EXPECT_NO_THROW(memset(frame_3->data, 1, bytes_for_size_type(size_type)));
-
-  auto invalid_frame = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  EXPECT_ANY_THROW(volatile_region.allocate(invalid_frame));
-  EXPECT_EQ(invalid_frame->data, nullptr);
-
-  // Deallocate two times
-  volatile_region.deallocate(frame_3);
-  volatile_region.deallocate(frame_1);
-
-  // Allocate 3 times again
-  auto new_frame_3 = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  volatile_region.allocate(new_frame_3);
-  EXPECT_NE(new_frame_3->data, nullptr);
-
-  auto new_frame_1 = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  volatile_region.allocate(new_frame_1);
-  EXPECT_NE(new_frame_1->data, nullptr);
-
-  auto new_invalid_frame = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  EXPECT_ANY_THROW(volatile_region.allocate(new_invalid_frame));
-  EXPECT_EQ(new_invalid_frame->data, nullptr);
-}
-
-TEST_F(VolatileRegionTest, TestMove) {
-  auto size_type = PageSizeType::KiB32;
-
-  auto volatile_region = VolatileRegion(size_type, PageType::Dram, bytes_for_size_type(size_type) * 3 + 10);
-  auto frame_1 = make_frame(PageID{0}, size_type, PageType::Dram, volatile_region.mapped_memory());
-  auto frame_2 = make_frame(PageID{0}, size_type, PageType::Dram);
-
-  EXPECT_EQ(frame_1->data, volatile_region.mapped_memory());
-  EXPECT_EQ(frame_2->data, nullptr);
-
-  volatile_region.move(frame_1, frame_2);
-
-  EXPECT_EQ(frame_2->data, volatile_region.mapped_memory());
-  EXPECT_EQ(frame_1->data, nullptr);
-}
-
-TEST_F(VolatileRegionTest, TestAllocateFree) {
-  auto size_type = PageSizeType::KiB32;
-
-  auto volatile_region = VolatileRegion(size_type, PageType::Dram, bytes_for_size_type(size_type) * 3 + 10);
-
-  EXPECT_EQ(volatile_region.useable_bytes(), bytes_for_size_type(size_type) * 3);
-
-  // Allocate three
-  auto frame_1 = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  volatile_region.allocate(frame_1);
-  EXPECT_EQ(frame_1->size_type, size_type);
-  EXPECT_NE(frame_1->data, nullptr);
-  EXPECT_NO_THROW(memset(frame_1->data, 1, bytes_for_size_type(size_type)));
-
-  auto frame_2 = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  volatile_region.allocate(frame_2);
-  EXPECT_EQ(frame_2->size_type, size_type);
-  EXPECT_NE(frame_2->data, nullptr);
-  EXPECT_NO_THROW(memset(frame_2->data, 1, bytes_for_size_type(size_type)));
-
-  auto frame_3 = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  volatile_region.allocate(frame_3);
-  EXPECT_EQ(frame_3->size_type, size_type);
-  EXPECT_NE(frame_3->data, nullptr);
-  EXPECT_NO_THROW(memset(frame_3->data, 1, bytes_for_size_type(size_type)));
-
-  auto invalid_frame = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  EXPECT_ANY_THROW(volatile_region.allocate(invalid_frame));
-  EXPECT_EQ(invalid_frame->data, nullptr);
-
-  // Free two times
-  volatile_region.free(frame_3);
-  volatile_region.free(frame_1);
-
-  // Allocate 3 times again
-  auto new_frame_3 = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  volatile_region.allocate(new_frame_3);
-  EXPECT_NE(new_frame_3->data, nullptr);
-
-  auto new_frame_1 = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  volatile_region.allocate(new_frame_1);
-  EXPECT_NE(new_frame_1->data, nullptr);
-
-  auto new_invalid_frame = make_frame(PageID{0}, PageSizeType::KiB32, PageType::Dram);
-  EXPECT_ANY_THROW(volatile_region.allocate(new_invalid_frame));
-  EXPECT_EQ(new_invalid_frame->data, nullptr);
-}
-
-TEST_F(VolatileRegionTest, TestCreateVolatileRegionsForSizeTypes) {
-  {
-    auto regions = create_volatile_regions_for_size_types(PageType::Dram, bytes_for_size_type(MAX_PAGE_SIZE_TYPE),
-                                                          NO_NUMA_MEMORY_NODE);
-    for (auto i = size_t{0}; i < regions.size(); ++i) {
-      EXPECT_EQ(regions[i]->get_size_type(), static_cast<PageSizeType>(i));
-      EXPECT_EQ(regions[i]->get_page_type(), PageType::Dram);
-      EXPECT_EQ(regions[i]->total_bytes(), bytes_for_size_type(MAX_PAGE_SIZE_TYPE));
-      EXPECT_EQ(regions[i]->useable_bytes() % bytes_for_size_type(regions[i]->get_size_type()), 0);
-      EXPECT_NE(regions[i]->mapped_memory(), nullptr);
+  ~RegionContext() {
+    if (mapped_region) {
+      unmap_region(mapped_region);
+      mapped_region = nullptr;
     }
   }
 
-  {
-    auto regions = create_volatile_regions_for_size_types(PageType::Dram, 1.5 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE),
-                                                          NO_NUMA_MEMORY_NODE);
-    for (auto i = size_t{0}; i < regions.size(); ++i) {
-      EXPECT_EQ(regions[i]->get_size_type(), static_cast<PageSizeType>(i));
-      EXPECT_EQ(regions[i]->get_page_type(), PageType::Dram);
-      EXPECT_EQ(regions[i]->total_bytes(), 96 * bytes_for_size_type(MIN_PAGE_SIZE_TYPE));
-      EXPECT_EQ(regions[i]->useable_bytes() % bytes_for_size_type(regions[i]->get_size_type()), 0);
-      EXPECT_NE(regions[i]->mapped_memory(), nullptr);
-    }
+  std::shared_ptr<VolatileRegion> region_for(const PageSizeType size_type) {
+    return regions[static_cast<size_t>(size_type)];
   }
+};
 
-  {
-    auto regions = create_volatile_regions_for_size_types(PageType::Dram, 3.2 * bytes_for_size_type(MAX_PAGE_SIZE_TYPE),
-                                                          NO_NUMA_MEMORY_NODE);
-    for (auto i = size_t{0}; i < regions.size(); ++i) {
-      EXPECT_EQ(regions[i]->get_size_type(), static_cast<PageSizeType>(i));
-      EXPECT_EQ(regions[i]->get_page_type(), PageType::Dram);
-      EXPECT_EQ(regions[i]->total_bytes(), 204 * bytes_for_size_type(MIN_PAGE_SIZE_TYPE));
-      EXPECT_EQ(regions[i]->useable_bytes() % bytes_for_size_type(regions[i]->get_size_type()), 0);
-      EXPECT_NE(regions[i]->mapped_memory(), nullptr);
-    }
-  }
+static void write_one_byte(std::byte* ptr) {
+  // Use volatile to avoid the compiler optimizing the access away
+  volatile std::byte* v = ptr;
+  v[0] = std::byte{0xAB};
 }
 
-TEST_F(VolatileRegionTest, TestNumaRegionAllocateDeallocate) {
+}  // namespace
+
+TEST_F(VolatileRegionTest, TestAllocateDeallocateReusesSlotsDeterministically) {
+  RegionContext ctx;
+
+  const auto size_type = PageSizeType::KiB32;
+  const auto region = ctx.region_for(size_type);
+
+  // Allocate three pages; with a fresh region and find_first(), these should be indices 0,1,2.
+  const auto [page_id_0, frame_0, ptr_0] = region->allocate();
+  const auto [page_id_1, frame_1, ptr_1] = region->allocate();
+  const auto [page_id_2, frame_2, ptr_2] = region->allocate();
+
+  ASSERT_TRUE(page_id_0.valid());
+  ASSERT_TRUE(page_id_1.valid());
+  ASSERT_TRUE(page_id_2.valid());
+
+  EXPECT_EQ(page_id_0.size_type(), size_type);
+  EXPECT_EQ(page_id_1.size_type(), size_type);
+  EXPECT_EQ(page_id_2.size_type(), size_type);
+
+  EXPECT_EQ(page_id_0.index, 0u);
+  EXPECT_EQ(page_id_1.index, 1u);
+  EXPECT_EQ(page_id_2.index, 2u);
+
+  EXPECT_NE(ptr_0, nullptr);
+  EXPECT_NE(ptr_1, nullptr);
+  EXPECT_NE(ptr_2, nullptr);
+  EXPECT_NE(ptr_0, ptr_1);
+  EXPECT_NE(ptr_0, ptr_2);
+  EXPECT_NE(ptr_1, ptr_2);
+
+  // Touch memory to ensure it's writable after allocate().
+  EXPECT_NO_THROW(std::memset(ptr_0, 0x11, page_id_0.num_bytes()));
+  EXPECT_NO_THROW(std::memset(ptr_1, 0x22, page_id_1.num_bytes()));
+  EXPECT_NO_THROW(std::memset(ptr_2, 0x33, page_id_2.num_bytes()));
+
+  // Deallocate two pages in a non-sorted order (2 and 0).
+  region->deallocate(page_id_2);
+  region->deallocate(page_id_0);
+
+  // Next allocations should return the smallest free index first (0), then (2).
+  const auto [page_id_a, frame_a, ptr_a] = region->allocate();
+  const auto [page_id_b, frame_b, ptr_b] = region->allocate();
+
+  EXPECT_EQ(page_id_a.index, 0u);
+  EXPECT_EQ(page_id_b.index, 2u);
+  EXPECT_NE(ptr_a, nullptr);
+  EXPECT_NE(ptr_b, nullptr);
+
+  // Cleanup remaining allocations.
+  region->deallocate(page_id_1);
+  region->deallocate(page_id_a);
+  region->deallocate(page_id_b);
+
+  (void)frame_0;
+  (void)frame_1;
+  (void)frame_2;
+  (void)frame_a;
+  (void)frame_b;
+}
+
+TEST_F(VolatileRegionTest, TestFreeIncrementsMetricsAndProtectsAgain) {
+  RegionContext ctx;
+
+  const auto size_type = PageSizeType::KiB32;
+  const auto region = ctx.region_for(size_type);
+
+  const auto before = ctx.metrics->num_madvice_free_calls.load(std::memory_order_relaxed);
+
+  const auto [page_id, frame, ptr] = region->allocate();
+  ASSERT_TRUE(page_id.valid());
+  ASSERT_NE(ptr, nullptr);
+
+  // Make sure page is writable now.
+  EXPECT_NO_THROW(write_one_byte(ptr));
+
+  // free() should madvise + protect again, and increment metrics.
+  region->free(page_id);
+
+  const auto after = ctx.metrics->num_madvice_free_calls.load(std::memory_order_relaxed);
+  EXPECT_EQ(after, before + 1);
+
+  // After free(), the page should be protected again (PROT_NONE) when ENABLE_MPROTECT is true.
+#if ENABLE_MPROTECT && GTEST_HAS_DEATH_TEST
+  ASSERT_DEATH_IF_SUPPORTED(
+      {
+        write_one_byte(ptr);
+      },
+      "");
+#endif
+
+  // Return slot.
+  region->deallocate(page_id);
+
+  (void)frame;
+}
+
+TEST_F(VolatileRegionTest, TestDeallocateProtectsAgain) {
+  RegionContext ctx;
+
+  const auto size_type = PageSizeType::KiB32;
+  const auto region = ctx.region_for(size_type);
+
+  const auto [page_id, frame, ptr] = region->allocate();
+  ASSERT_TRUE(page_id.valid());
+  ASSERT_NE(ptr, nullptr);
+
+  // Writable after allocate.
+  EXPECT_NO_THROW(write_one_byte(ptr));
+
+  region->deallocate(page_id);
+
+#if ENABLE_MPROTECT && GTEST_HAS_DEATH_TEST
+  ASSERT_DEATH_IF_SUPPORTED(
+      {
+        write_one_byte(ptr);
+      },
+      "");
+#endif
+
+  (void)frame;
+}
+
+TEST_F(VolatileRegionTest, TestMbindUpdatesFrameNodeIdWhenLocked) {
 #if !HYRISE_NUMA_SUPPORT
   GTEST_SKIP() << "NUMA support not compiled in";
 #endif
 
-  auto size_type = PageSizeType::KiB32;
-  const auto region_size = 1 << 30;  // 1 GiB
+#if HYRISE_NUMA_SUPPORT
+  if (numa_available() < 0) {
+    GTEST_SKIP() << "NUMA not available at runtime";
+  }
+  if (numa_max_node() < 1) {
+    GTEST_SKIP() << "Need at least 2 NUMA nodes to run this test (nodes 0 and 1)";
+  }
 
-  auto volatile_region1 = VolatileRegion(size_type, PageType::Numa, region_size);
+  RegionContext ctx;
+
+  const auto size_type = PageSizeType::KiB32;
+  const auto region = ctx.region_for(size_type);
+
+  const auto before = ctx.metrics->num_numa_tonode_memory_calls.load(std::memory_order_relaxed);
+
+  const auto [page_id, frame, ptr] = region->allocate();
+  ASSERT_TRUE(page_id.valid());
+  ASSERT_NE(frame, nullptr);
+  ASSERT_NE(ptr, nullptr);
+
+  auto state_and_version = frame->state_and_version();
+  ASSERT_TRUE(frame->try_lock_exclusive(state_and_version));
+
+  const auto target_node = NodeID{1};
+  region->mbind_to_numa_node(page_id, target_node);
+
+  EXPECT_EQ(frame->node_id(), target_node);
+
+  frame->unlock_exclusive();
+
+  const auto after = ctx.metrics->num_numa_tonode_memory_calls.load(std::memory_order_relaxed);
+  EXPECT_EQ(after, before + 1);
+
+  region->deallocate(page_id);
+#endif
 }
 
 }  // namespace hyrise
