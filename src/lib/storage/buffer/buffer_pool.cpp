@@ -213,11 +213,11 @@ bool BufferPool::ensure_free_pages(const PageSizeType required_size) {
     // DebugAssert(Frame::state(frame->state_and_version()) != Frame::LOCKED, "Frame cannot be locked");
 
     const auto size_type = item.page_id.size_type();
-    freed_bytes += bytes_for_size_type(size_type);
-  }
+    const auto evicted_bytes = bytes_for_size_type(size_type);
+    freed_bytes += evicted_bytes;
 
-  // TODO: Check if this is correct
-  free_bytes(freed_bytes);
+    free_bytes(evicted_bytes);
+  }
 
   return true;
 }
