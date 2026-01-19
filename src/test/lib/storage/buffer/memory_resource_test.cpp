@@ -1,229 +1,122 @@
+#include <algorithm>
+#include <cstddef>
 #include <memory>
+#include <vector>
 
 #include "base_test.hpp"
 
+#include "storage/buffer/buffer_manager.hpp"
+#include "storage/buffer/helper.hpp"
 #include "storage/buffer/memory_resource.hpp"
-#include "types.hpp"
-
-// Used for testing the NewDeleteMemoryResource
-std::size_t allocation_count = 0;
-
-void* operator new[](std::size_t size, std::align_val_t align) {
-  ++allocation_count;
-  auto ptr = std::aligned_alloc(std::size_t(align), size);
-  return ptr;
-}
-
-void operator delete[](void* p, std::align_val_t align) noexcept {
-  --allocation_count;
-  return std::free(p);
-}
 
 namespace hyrise {
 
-class LogResource : public MemoryResource {
- public:
-  LogResource() = default;
+class LinearBufferResourceTest : public BaseTest {};
 
-  BufferPtr<void> allocate(const std::size_t bytes, const std::size_t alignment) override {
-    auto allocated_dram_frame =
-        make_frame(PageID{allocations.size()}, find_fitting_page_size_type(bytes), PageType::Dram);
-    allocations.emplace_back(allocated_dram_frame, bytes, alignment);
-    return BufferPtr<void>(allocated_dram_frame.get(), 0, typename BufferPtr<void>::AllocTag{});
-  }
+TEST_F(LinearBufferResourceTest, TestConstructorAndReset) {
+  auto& resource = LinearBufferResource::get();
 
-  void deallocate(BufferPtr<void> p, const std::size_t bytes, const std::size_t alignment) override {
-    Fail("This should never be called");
-  }
+  // Reset should clear the thread-local state
+  resource.reset();
+  EXPECT_EQ(resource.remaining_storage(), 0u);
 
-  std::vector<std::tuple<FramePtr, std::size_t, std::size_t>> allocations;
-};
+  // First small allocation should create a new internal page and reduce remaining by 1
+  const auto page_bytes = bytes_for_size_type(LinearBufferResource::PAGE_SIZE_TYPE);
 
-class MonotonicBufferResourceTest : public BaseTest {};
+  auto* first_ptr = resource.allocate(1u, 1u);
+  ASSERT_NE(first_ptr, nullptr);
+  EXPECT_EQ(resource.remaining_storage(), page_bytes - 1u);
 
-TEST_F(MonotonicBufferResourceTest, TestConstructor) {
-  auto log_resource = LogResource{};
-  {
-    // Test default constructor
-    auto monotonic_buffer_resource = MonotonicBufferResource{&log_resource};
-    monotonic_buffer_resource.allocate(1, 1);
-    EXPECT_EQ(monotonic_buffer_resource.remaining_storage(), bytes_for_size_type(PageSizeType::KiB8) - 1u);
-  }
-  {
-    // Test constructor with a higher page size type
-    auto monotonic_buffer_resource = MonotonicBufferResource{&log_resource, PageSizeType::KiB64};
-    monotonic_buffer_resource.allocate(1, 1);
-    EXPECT_EQ(monotonic_buffer_resource.remaining_storage(), bytes_for_size_type(PageSizeType::KiB64) - 1u);
-  }
+  // Reset clears bookkeeping (does not free the BM allocation by design)
+  resource.reset();
+  EXPECT_EQ(resource.remaining_storage(), 0u);
+
+  // TODO: We need a cleaner way
+  BufferManager::get().deallocate(first_ptr, page_bytes, alignof(std::max_align_t));
 }
 
-TEST_F(MonotonicBufferResourceTest, TestAllocate) {
-  // This test is copied from boost
-  auto remaining_storage = std::size_t{0};
+TEST_F(LinearBufferResourceTest, TestRemainingStorageAndAlignmentWaste) {
+  auto& resource = LinearBufferResource::get();
+  resource.reset();
 
-  auto log_resource = LogResource{};
-  auto monotonic_buffer_resource = MonotonicBufferResource{&log_resource};
+  const auto page_bytes = bytes_for_size_type(LinearBufferResource::PAGE_SIZE_TYPE);
 
-  {
-    // Initial size with no buffer
-    EXPECT_EQ(log_resource.allocations.size(), 0);
-    monotonic_buffer_resource.allocate(1, 1);
-    EXPECT_EQ(log_resource.allocations.size(), 1);
-    auto remaining = monotonic_buffer_resource.remaining_storage();
-    EXPECT_EQ(remaining, bytes_for_size_type(PageSizeType::KiB8) - 1u);
-    remaining_storage = remaining;
-  }
-  {
-    // Ask for more internal storage with misaligned current buffer
-    std::size_t wasted_due_to_alignment;
-    monotonic_buffer_resource.remaining_storage(4u, wasted_due_to_alignment);
-    EXPECT_EQ(wasted_due_to_alignment, 3u);
-    monotonic_buffer_resource.allocate(4, 4);
-    EXPECT_EQ(log_resource.allocations.size(), 1u);
-    auto remaining = monotonic_buffer_resource.remaining_storage();
-    //We wasted some bytes due to alignment plus 4 bytes of real storage
-    EXPECT_EQ(remaining, remaining_storage - 4 - wasted_due_to_alignment);
-    remaining_storage = remaining;
-  }
-  {
-    // request the same alignment to test no storage is wasted
-    std::size_t wasted_due_to_alignment;
-    auto remaining = monotonic_buffer_resource.remaining_storage(1u, wasted_due_to_alignment);
-    EXPECT_EQ(log_resource.allocations.size(), 1u);
-    monotonic_buffer_resource.allocate(4, 4);
-    //It should not have allocated
-    EXPECT_EQ(log_resource.allocations.size(), 1u);
-    remaining = monotonic_buffer_resource.remaining_storage();
-    //We wasted no bytes due to alignment plus 4 bytes of real storage
-    EXPECT_EQ(remaining, remaining_storage - 4u);
-    remaining_storage = remaining;
-  }
-  {
-    // Exhaust the remaining storage with 2 byte alignment (the last allocation
-    // was 4 bytes with 4 byte alignment) so it should be already 2-byte aligned.
-    // We trigger it twice to avoid the 80% fill threshold
-    monotonic_buffer_resource.allocate(remaining_storage / 2, 2);
-    monotonic_buffer_resource.allocate(monotonic_buffer_resource.remaining_storage(), 2);
-    std::size_t wasted_due_to_alignment;
-    std::size_t remaining = monotonic_buffer_resource.remaining_storage(1u, wasted_due_to_alignment);
-    EXPECT_EQ(wasted_due_to_alignment, 0u);
-    EXPECT_EQ(remaining, 0u);
-    //It should not have allocated
-    EXPECT_EQ(log_resource.allocations.size(), 1u);
-    remaining_storage = 0u;
-  }
-  {
-    //The next allocation should trigger the upstream resource
-    monotonic_buffer_resource.allocate(1u, 1u);
-    EXPECT_EQ(log_resource.allocations.size(), 2u);
-    //The next allocation should be geometrically bigger.
-    EXPECT_EQ(std::get<1>(log_resource.allocations[1]),
-              2 * bytes_for_size_type(MonotonicBufferResource::INITIAL_PAGE_SIZE_TYPE));
-    std::size_t wasted_due_to_alignment;
-    //For a 2 byte alignment one byte will be wasted from the previous 1 byte allocation
-    std::size_t remaining = monotonic_buffer_resource.remaining_storage(2u, wasted_due_to_alignment);
-    EXPECT_EQ(wasted_due_to_alignment, 1u);
-    EXPECT_EQ(remaining, std::get<1>(log_resource.allocations[1]) - 1u - wasted_due_to_alignment);
-    //It should not have allocated
-    remaining_storage = monotonic_buffer_resource.remaining_storage(1u);
-  }
-  {
-    // Try some allocation over 80% of a page size and verify the remaining storage hasn't changed,
-    // but another page was allocatee from the upstream resource
-    monotonic_buffer_resource.allocate(bytes_for_size_type(PageSizeType::KiB64) * 0.85, 1u);
-    EXPECT_EQ(log_resource.allocations.size(), 3u);
-    EXPECT_EQ(static_cast<size_t>(bytes_for_size_type(PageSizeType::KiB64) * 0.85),
-              std::get<1>(log_resource.allocations[2]));
-    EXPECT_EQ(remaining_storage, monotonic_buffer_resource.remaining_storage(1u));
-    monotonic_buffer_resource.allocate(bytes_for_size_type(PageSizeType::KiB16) * 0.90, 1u);
-    EXPECT_EQ(log_resource.allocations.size(), 4u);
-    EXPECT_EQ(static_cast<size_t>(bytes_for_size_type(PageSizeType::KiB16) * 0.9),
-              std::get<1>(log_resource.allocations[3]));
-    EXPECT_EQ(remaining_storage, monotonic_buffer_resource.remaining_storage(1u));
-  }
-  {
-    //Now try a bigger than next allocation and see if the page size is increased
-    // We are actually allocating the whole page size, since we are still under 80% of the next page size
-    monotonic_buffer_resource.allocate(bytes_for_size_type(PageSizeType::KiB32) * 0.75, 1u);
-    EXPECT_EQ(log_resource.allocations.size(), 5u);
-    EXPECT_EQ(static_cast<size_t>(bytes_for_size_type(PageSizeType::KiB32)), std::get<1>(log_resource.allocations[4]));
+  // First allocation: consumes 1 byte at offset 0
+  auto* page_base = resource.allocate(1u, 1u);
+  ASSERT_NE(page_base, nullptr);
+  EXPECT_EQ(resource.remaining_storage(), page_bytes - 1u);
 
-    monotonic_buffer_resource.allocate(bytes_for_size_type(PageSizeType::KiB64) * 0.72, 1u);
-    EXPECT_EQ(log_resource.allocations.size(), 6u);
-    EXPECT_EQ(static_cast<size_t>(bytes_for_size_type(PageSizeType::KiB64)), std::get<1>(log_resource.allocations[5]));
+  // With current position == 1, requesting 4-byte alignment should waste 3 bytes
+  std::size_t wasted = 0;
+  (void)resource.remaining_storage(4u, wasted);
+  EXPECT_EQ(wasted, 3u);
 
-    monotonic_buffer_resource.allocate(bytes_for_size_type(PageSizeType::KiB128) * 0.79, 1u);
-    EXPECT_EQ(log_resource.allocations.size(), 7u);
-    EXPECT_EQ(static_cast<size_t>(bytes_for_size_type(PageSizeType::KiB128)), std::get<1>(log_resource.allocations[6]));
+  // Allocate 4 bytes aligned to 4 -> consumes wasted(3) + bytes(4)
+  auto* p = resource.allocate(4u, 4u);
+  ASSERT_NE(p, nullptr);
 
-    monotonic_buffer_resource.allocate(bytes_for_size_type(PageSizeType::KiB256) * 0.71, 1u);
-    EXPECT_EQ(log_resource.allocations.size(), 8u);
-    EXPECT_EQ(static_cast<size_t>(bytes_for_size_type(PageSizeType::KiB256)), std::get<1>(log_resource.allocations[7]));
-  }
-  {
-    // Try some more allocations, until we reach the max upstream page size
-    monotonic_buffer_resource.allocate(bytes_for_size_type(PageSizeType::KiB256) * 0.75, 1u);
-    EXPECT_EQ(log_resource.allocations.size(), 9u);
-    EXPECT_EQ(static_cast<size_t>(bytes_for_size_type(PageSizeType::KiB256)), std::get<1>(log_resource.allocations[8]));
+  // Remaining should have decreased by 7 total compared to after first allocation
+  EXPECT_EQ(resource.remaining_storage(), page_bytes - 1u - 3u - 4u);
 
-    monotonic_buffer_resource.allocate(bytes_for_size_type(PageSizeType::KiB256) * 0.75, 1u);
-    EXPECT_EQ(log_resource.allocations.size(), 10u);
-    EXPECT_EQ(static_cast<size_t>(bytes_for_size_type(PageSizeType::KiB256)), std::get<1>(log_resource.allocations[9]));
-
-    EXPECT_ANY_THROW(monotonic_buffer_resource.allocate(bytes_for_size_type(PageSizeType::KiB512) * 0.75, 1u));
-    EXPECT_EQ(log_resource.allocations.size(), 10u);
-  }
+  // Clean up
+  resource.reset();
+  // TODO: We need a cleaner way
+  BufferManager::get().deallocate(page_base, page_bytes, alignof(std::max_align_t));
 }
 
-TEST_F(MonotonicBufferResourceTest, TestDeallocate) {
-  auto log_resource = LogResource{};
-  constexpr std::size_t iterations = 10;
+TEST_F(LinearBufferResourceTest, TestDeallocateIsNoOpForSubAllocations) {
+  auto& resource = LinearBufferResource::get();
+  resource.reset();
 
-  auto monotonic_buffer_resource = MonotonicBufferResource{&log_resource};
-  std::array<BufferPtr<void>, iterations> buffers;
-  std::array<size_t, iterations> sizes;
+  const auto page_bytes = bytes_for_size_type(LinearBufferResource::PAGE_SIZE_TYPE);
 
-  for (auto i = 0; i < iterations; ++i) {
-    sizes[i] = monotonic_buffer_resource.remaining_storage() + 1;
-    monotonic_buffer_resource.allocate(sizes[i], 1);
-    EXPECT_EQ(log_resource.allocations.size(), i + 1);
-  }
+  // First small alloc -> creates a page; ptr is page base
+  auto* page_base = resource.allocate(8u, 1u);
+  ASSERT_NE(page_base, nullptr);
 
-  // All storage stays the same during deallocation
-  std::size_t remaining = monotonic_buffer_resource.remaining_storage();
-  for (auto i = 0; i < iterations; ++i) {
-    monotonic_buffer_resource.deallocate(buffers[i], sizes[i], 1u);
-    EXPECT_EQ(log_resource.allocations.size(), iterations);
-    EXPECT_EQ(monotonic_buffer_resource.remaining_storage(), remaining);
-  }
+  const auto remaining_before = resource.remaining_storage();
+
+  // A second small alloc will be a sub-allocation from the current page
+  auto* sub_ptr = resource.allocate(16u, 1u);
+  ASSERT_NE(sub_ptr, nullptr);
+
+  const auto remaining_after_alloc = resource.remaining_storage();
+  EXPECT_LT(remaining_after_alloc, remaining_before);
+
+  // Deallocate of sub-allocation should be a no-op
+  // TODO: We need a centralized way to deallocate these pages
+  resource.deallocate(sub_ptr, 16u, 1u);
+  EXPECT_EQ(resource.remaining_storage(), remaining_after_alloc);
+
+  // Clean up
+  resource.reset();
+  // TODO: We need a cleaner way
+  BufferManager::get().deallocate(page_base, page_bytes, alignof(std::max_align_t));
 }
 
-TEST_F(MonotonicBufferResourceTest, TestDestructor) {
-  // Verify that the pages still exist after the destructor is called
-  auto log_resource = LogResource{};
-  {
-    auto monotonic_buffer_resource = MonotonicBufferResource{&log_resource};
-    for (auto i = 0; i < 10; ++i) {
-      monotonic_buffer_resource.allocate(monotonic_buffer_resource.remaining_storage() + 1, 1);
-      EXPECT_EQ(log_resource.allocations.size(), i + 1);
-    }
-  }
-  EXPECT_EQ(log_resource.allocations.size(), 10);
-}
+TEST_F(LinearBufferResourceTest, TestDirectAllocationsAreFreed) {
+  auto& resource = LinearBufferResource::get();
+  resource.reset();
 
-class NewDeleteMemoryResourceTest : public BaseTest {};
+  // Pick a size that triggers fills_page():
+  // bytes_for_size_type(KiB64) * 0.85 exceeds the 80% threshold of the fitting page size type.
+  const auto big_bytes = static_cast<std::size_t>(bytes_for_size_type(PageSizeType::KiB64) * 0.85);
 
-TEST_F(NewDeleteMemoryResourceTest, TestAllocateAndDeallocate) {
-  auto memory_resource = NewDeleteMemoryResource{};
-  EXPECT_EQ(allocation_count, 0);
+  auto metrics = BufferManager::get().metrics();
+  const auto allocs_before = metrics->num_allocs.load(std::memory_order_relaxed);
+  const auto deallocs_before = metrics->num_deallocs.load(std::memory_order_relaxed);
 
-  auto ptr = memory_resource.allocate(64, 8);
-  EXPECT_EQ(allocation_count, 1);
-  EXPECT_EQ(ptr.get_frame(), nullptr) << "Ptr should not buffer managed";
-  EXPECT_EQ(reinterpret_cast<std::uintptr_t>(ptr.get()) % 4, 0) << "Ptr should be 4 byte aligned";
+  auto* big_ptr = resource.allocate(big_bytes, 8u);
+  ASSERT_NE(big_ptr, nullptr);
 
-  memory_resource.deallocate(ptr, 64, 8);
-  EXPECT_EQ(allocation_count, 0);
+  const auto allocs_after = metrics->num_allocs.load(std::memory_order_relaxed);
+  EXPECT_GE(allocs_after, allocs_before + 1) << "Expected BufferManager allocation for fills_page() path";
+
+  // This must free again
+  resource.deallocate(big_ptr, big_bytes, 8u);
+
+  const auto deallocs_after = metrics->num_deallocs.load(std::memory_order_relaxed);
+  EXPECT_GE(deallocs_after, deallocs_before + 1) << "Expected BufferManager deallocation for fills_page() path";
 }
 
 }  // namespace hyrise
