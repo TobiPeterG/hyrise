@@ -3,6 +3,7 @@
 #include <boost/container/pmr/memory_resource.hpp>
 #include "storage/buffer/buffer_manager.hpp"
 #include "utils/singleton.hpp"
+#include <unordered_set>
 
 namespace hyrise {
 
@@ -14,6 +15,7 @@ struct LinearBufferResourceState {
 };
 
 static thread_local LinearBufferResourceState linear_buffer_resource_state = LinearBufferResourceState{nullptr, 0, 0};
+static thread_local std::unordered_set<void*> linear_direct_allocations{};
 
 }  // namespace detail
 

@@ -54,7 +54,12 @@ void* LinearBufferResource::do_allocate(std::size_t bytes, std::size_t alignment
   }
 
   if (fills_page(bytes)) {
-    return _buffer_manager->allocate(bytes, alignment);
+    auto* ptr = _buffer_manager->allocate(bytes, alignment);
+
+    // Track direct allocations so we can safely deallocate them later.
+    detail::linear_direct_allocations.insert(ptr);
+
+    return ptr;
   }
 
   std::size_t aligner = 0u;
@@ -65,9 +70,6 @@ void* LinearBufferResource::do_allocate(std::size_t bytes, std::size_t alignment
     detail::linear_buffer_resource_state.current_buffer_size = bytes_for_size_type(PAGE_SIZE_TYPE);
     detail::linear_buffer_resource_state.current_buffer_pos = 0u;
 
-    // detail::linear_buffer_resource_state.current_buffer_size =
-    //     bytes_for_size_type(PAGE_SIZE_TYPE) - sizeof(AllocationCountType);
-    // detail::linear_buffer_resource_state.current_buffer_pos = sizeof(AllocationCountType);
     DebugAssert(detail::linear_buffer_resource_state.current_buffer_size >= bytes,
                 "Buffer overflow while allocating new page");
   }
@@ -84,15 +86,17 @@ LinearBufferResource::AllocationCountType& LinearBufferResource::allocation_coun
   return *reinterpret_cast<AllocationCountType*>(buffer);
 };
 
-void LinearBufferResource::do_deallocate(void* ptr, std::size_t, std::size_t) {
-  // TODO
-  // auto page_id = _buffer_manager->find_page(ptr);
-  // auto page_ptr = nullptr;
+void LinearBufferResource::do_deallocate(void* ptr, std::size_t bytes, std::size_t alignment) {
+  // Only free allocations that were done via the "fills_page" direct BM allocation path.
+  const auto it = detail::linear_direct_allocations.find(ptr);
+  if (it == detail::linear_direct_allocations.end()) {
+    return;  // monotonic sub-allocation -> no-op by design
+  }
 
-  // if (LinearBufferResource::allocation_count(page_ptr).fetch_sub(1, std::memory_order_release) == 1) {
-  //   boost::atomic_thread_fence(boost::memory_order_acquire);
-  //   _buffer_manager->do_deallocate(ptr, bytes_for_size_type(page_id.size_type()), alignof(std::max_align_t));
-  // }
+  detail::linear_direct_allocations.erase(it);
+
+  // Forward deallocation to the BufferManager using the same bytes/alignment the caller provides.
+  _buffer_manager->deallocate(ptr, bytes, alignment);
 }
 
 bool LinearBufferResource::do_is_equal(const boost::container::pmr::memory_resource& other) const noexcept {
