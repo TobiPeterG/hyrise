@@ -177,7 +177,6 @@ set(
     lib/statistics/statistics_objects/string_histogram_domain_test.cpp
     lib/statistics/table_statistics_test.cpp
     lib/storage/any_segment_iterable_test.cpp
-    # lib/storage/buffer/buffer_ptr_test.cpp
     lib/storage/buffer/buffer_manager_stress_test.cpp
     # lib/storage/buffer/memory_resource_test.cpp
     lib/storage/buffer/buffer_manager_test.cpp
