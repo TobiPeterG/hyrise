@@ -57,12 +57,12 @@ static std::vector<std::string> registered_eviction_strategies() {
 
 }  // namespace
 
-class BufferManagerStressTest : public BaseTest, public ::testing::WithParamInterface<std::string> {
+class BufferManagerConcurrencyStressTest : public BaseTest, public ::testing::WithParamInterface<std::string> {
  protected:
   void SetUp() override {}
 };
 
-TEST_P(BufferManagerStressTest, TestPinAndUnpins) {
+TEST_P(BufferManagerConcurrencyStressTest, TestPinAndUnpins) {
   const auto ssd_path =
       std::filesystem::temp_directory_path() / ("hyrise_stress_test_" + gtest_param_name(GetParam()));
 
@@ -176,7 +176,7 @@ TEST_P(BufferManagerStressTest, TestPinAndUnpins) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    RegisteredEvictionStrategies, BufferManagerStressTest, ::testing::ValuesIn(registered_eviction_strategies()),
+    RegisteredEvictionStrategies, BufferManagerConcurrencyStressTest, ::testing::ValuesIn(registered_eviction_strategies()),
     [](const ::testing::TestParamInfo<std::string>& info) { return gtest_param_name(info.param); });
 
 }  // namespace hyrise
