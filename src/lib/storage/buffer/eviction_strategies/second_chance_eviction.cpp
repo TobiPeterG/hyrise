@@ -18,7 +18,6 @@ void SecondChanceEviction::add_eviction_candidate(const PageID& page_id, Frame* 
   DebugAssert(frame->node_id() == _buffer_pool.node_id, "Memory node mismatch");
   increment_counter(_buffer_pool.metrics->num_eviction_queue_adds);
   _eviction_queue.push({page_id, Frame::version(current_state_and_version)});
-  // _eviction_queue.emplace(page_id, Frame::version(current_state_and_version));
 }
 
 bool SecondChanceEviction::perform_evictions(const PageSizeType required_size) {
@@ -31,7 +30,7 @@ bool SecondChanceEviction::perform_evictions(const PageSizeType required_size) {
   auto item = EvictionItem{};
 
   // Find potential victim frame if we don't have enough space left
-  // TODO: Verify, that this is correct, cceh kthe numbersm, verify value type
+  // TODO: Verify, that this is correct
   while (_buffer_pool.used_bytes.load(std::memory_order_relaxed) > _buffer_pool.max_bytes) {
     if (!_eviction_queue.try_pop(item)) {
 #ifndef NDEBUG
@@ -41,35 +40,41 @@ bool SecondChanceEviction::perform_evictions(const PageSizeType required_size) {
                 << " max_bytes=" << _buffer_pool.max_bytes << " freed_bytes=" << freed_bytes
                 << " node_id=" << _buffer_pool.node_id << "\n";
 #endif
-      _buffer_pool.free_bytes(bytes_required);  // TODO: Check if this is correct
+      _buffer_pool.free_bytes(bytes_required);
       return false;
     }
 
     auto region = _buffer_pool.volatile_regions[static_cast<uint64_t>(item.page_id.size_type())];
     auto frame = region->get_frame(item.page_id);
-    auto current_state_and_version = frame->state_and_version();
+    const auto current_state_and_version = frame->state_and_version();
 
     if (frame->node_id() != _buffer_pool.node_id) {
       increment_counter(_buffer_pool.metrics->num_eviction_queue_items_purged);
       continue;
     }
 
-    // If the frame is already marked, we can evict it
-    if (!item.can_evict(current_state_and_version)) {
-      // If the frame is UNLOCKED, we can mark it
-      if (item.can_mark(current_state_and_version)) {
-        if (frame->try_mark(current_state_and_version)) {
-          add_eviction_candidate(item.page_id, frame);
-          continue;
-        }
-      }
+    // Stale entry (frame generation changed)
+    if (Frame::version(current_state_and_version) != item.timestamp) {
       increment_counter(_buffer_pool.metrics->num_eviction_queue_items_purged);
       continue;
     }
 
-    // Try locking the frame exclusively, TODO: prefer shared locking
+    // Keep pinned frames in the list; skip by requeueing.
+    if (Frame::state(current_state_and_version) != Frame::UNLOCKED) {
+      _eviction_queue.push(item);
+      continue;
+    }
+
+    // Second chance
+    if (Frame::is_referenced(current_state_and_version)) {
+      frame->clear_reference();
+      _eviction_queue.push(item);
+      continue;
+    }
+
+    // Try locking the frame exclusively
     if (!frame->try_lock_exclusive(current_state_and_version)) {
-      increment_counter(_buffer_pool.metrics->num_eviction_queue_items_purged);
+      _eviction_queue.push(item);
       continue;
     }
 
@@ -77,15 +82,10 @@ bool SecondChanceEviction::perform_evictions(const PageSizeType required_size) {
            "Memory node mismatch: " + std::to_string(frame->node_id()) + " != " + std::to_string(_buffer_pool.node_id));
 
     _buffer_pool.evict(item, frame);
-
     increment_counter(_buffer_pool.metrics->num_evictions);
 
-    // DebugAssert(Frame::state(frame->state_and_version()) != Frame::LOCKED, "Frame cannot be locked");
-
-    const auto size_type = item.page_id.size_type();
-    const auto evicted_bytes = bytes_for_size_type(size_type);
+    const auto evicted_bytes = bytes_for_size_type(item.page_id.size_type());
     freed_bytes += evicted_bytes;
-
     _buffer_pool.free_bytes(evicted_bytes);
   }
 
@@ -101,13 +101,15 @@ void SecondChanceEviction::purge_eviction_candidates() {
 
     const auto region = _buffer_pool.volatile_regions[static_cast<uint64_t>(item.page_id.size_type())];
     auto frame = region->get_frame(item.page_id);
-    auto current_state_and_version = frame->state_and_version();
+    const auto current_state_and_version = frame->state_and_version();
 
-    // The item is in state UNLOCKED and can be marked
-    if (item.can_evict(current_state_and_version) || item.can_mark(current_state_and_version)) {
-      _eviction_queue.push(item);
+    // Purge stale or migrated entries. Keep pinned/ref entries.
+    if (frame->node_id() != _buffer_pool.node_id || Frame::version(current_state_and_version) != item.timestamp) {
+      increment_counter(_buffer_pool.metrics->num_eviction_queue_items_purged);
       continue;
     }
+
+    _eviction_queue.push(item);
   }
 }
 

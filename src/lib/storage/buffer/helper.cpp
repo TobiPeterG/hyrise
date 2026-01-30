@@ -1,21 +1,31 @@
 #include "storage/buffer/helper.hpp"
+
 #include "storage/buffer/buffer_manager.hpp"
 #include "storage/buffer/volatile_region.hpp"
 
 #include <sys/mman.h>
 #include <unistd.h>
+
 #include <chrono>
 #include <fstream>
 #include <utility>
 
 namespace hyrise {
 
-bool EvictionItem::can_evict(Frame::StateVersionType state_and_version) const {
-  return Frame::state(state_and_version) == Frame::MARKED && Frame::version(state_and_version) == timestamp;
+bool EvictionItem::can_mark(Frame::StateVersionType state_and_version) const {
+  // Candidate is still the same frame generation (version matches), and is currently not exclusively locked.
+  // We require the frame to be UNLOCKED (pinned frames remain candidates but are skipped).
+  if (Frame::state(state_and_version) != Frame::UNLOCKED) {
+    return false;
+  }
+  return Frame::version(state_and_version) == timestamp;
 }
 
-bool EvictionItem::can_mark(Frame::StateVersionType state_and_version) const {
-  return Frame::state(state_and_version) == Frame::UNLOCKED && Frame::version(state_and_version) == timestamp;
+bool EvictionItem::can_evict(Frame::StateVersionType state_and_version) const {
+  if (!can_mark(state_and_version)) {
+    return false;
+  }
+  return !Frame::is_referenced(state_and_version);
 }
 
 boost::container::pmr::memory_resource* get_buffer_manager_memory_resource() {
@@ -27,7 +37,7 @@ boost::container::pmr::memory_resource* get_buffer_manager_memory_resource() {
 //----------------------------------------------------
 
 std::byte* create_mapped_region() {
-  const auto align = bytes_for_size_type(MAX_PAGE_SIZE_TYPE); // TODO: Correct?
+  const auto align = bytes_for_size_type(MAX_PAGE_SIZE_TYPE);
   const auto total = DEFAULT_RESERVED_VIRTUAL_MEMORY + align;
 
 #ifdef __APPLE__
@@ -41,7 +51,6 @@ std::byte* create_mapped_region() {
     Fail("Failed to map volatile pool region: " + std::string(strerror(errno)));
   }
 
-  // TODO: Check again
   auto raw_u = reinterpret_cast<std::uintptr_t>(raw);
   auto aligned_u = (raw_u + (align - 1)) & ~(align - 1);
   auto aligned = reinterpret_cast<std::byte*>(aligned_u);

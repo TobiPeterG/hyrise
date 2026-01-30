@@ -386,6 +386,8 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
       // Required: page is now resident on DRAM
       frame->set_node_id(_primary_buffer_pool->node_id);
 
+      add_to_eviction_queue(page_id, frame);
+
       increment_counter(_metrics->total_misses);
       increment_counter(_metrics->total_bytes_copied_from_ssd_to_dram, page_id.num_bytes());
       return;
@@ -418,6 +420,8 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
         // Required
         frame->set_node_id(_primary_buffer_pool->node_id);
 
+        add_to_eviction_queue(page_id, frame);
+
         increment_counter(_metrics->total_bytes_copied_from_ssd_to_dram, page_id.num_bytes());
       } else {
         // Case 4.2: We bypass load the page into NUMA
@@ -433,6 +437,8 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
 
         // Required
         frame->set_node_id(_secondary_buffer_pool->node_id);
+
+        add_to_eviction_queue(page_id, frame);
 
         increment_counter(_metrics->total_bytes_copied_from_ssd_to_numa, page_id.num_bytes());
       }
@@ -470,6 +476,8 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
       // Required: page is now on DRAM (prevents wrong refunds / double refunds later)
       frame->set_node_id(_primary_buffer_pool->node_id);
 
+      add_to_eviction_queue(page_id, frame);
+
       increment_counter(_metrics->total_hits);
       increment_counter(_metrics->total_bytes_copied_from_numa_to_dram, page_id.num_bytes());
       return;
@@ -502,9 +510,8 @@ void BufferManager::pin_shared(const PageID page_id, const AccessIntent accessIn
         break;
       }
       default: {
-        // TODO: Still call make resident here? we actually have many reads now
-        // and we should leverage the mechanism, addtional reads would benefit
         if (frame->try_lock_shared(state_and_version)) {
+          frame->mark_referenced();
           return;
         }
         break;
@@ -529,14 +536,15 @@ void BufferManager::pin_exclusive(const PageID page_id) {
       case Frame::EVICTED: {
         if (frame->try_lock_exclusive(state_and_version)) {
           make_resident(page_id, AccessIntent::Write, state_and_version);
+          frame->mark_referenced();
           return;
         }
         break;
       }
-      case Frame::MARKED:
       case Frame::UNLOCKED: {
         if (frame->try_lock_exclusive(state_and_version)) {
           make_resident(page_id, AccessIntent::Write, state_and_version);
+          frame->mark_referenced();
           return;
         }
         break;
@@ -552,9 +560,7 @@ void BufferManager::unpin_shared(const PageID page_id) {
 
   increment_counter(_metrics->current_pins, -1);
   auto frame = get_region(page_id)->get_frame(page_id);
-  if (frame->unlock_shared()) {
-    add_to_eviction_queue(page_id, frame);
-  }
+  frame->unlock_shared();
 }
 
 void BufferManager::unpin_exclusive(const PageID page_id) {
@@ -563,7 +569,6 @@ void BufferManager::unpin_exclusive(const PageID page_id) {
   increment_counter(_metrics->current_pins, -1);
   auto frame = get_region(page_id)->get_frame(page_id);
   frame->unlock_exclusive();
-  add_to_eviction_queue(page_id, frame);
 }
 
 void BufferManager::set_dirty(const PageID page_id) {
@@ -698,6 +703,9 @@ void* BufferManager::do_allocate(std::size_t bytes, std::size_t alignment) {
 
     // Required: make accounting and deallocation consistent
     frame->set_node_id(buffer_pool->node_id);
+
+    buffer_pool->add_eviction_candidate(page_id, frame);
+    frame->set_reference_max();
 
 #ifndef NDEBUG
     bool in_extent_hooks_inner = false;

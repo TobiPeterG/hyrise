@@ -39,10 +39,10 @@ struct HelperTestContext {
 
 }  // namespace
 
-TEST_F(HelperTest, EvictionItemCanMarkAndCanEvictMatchStateAndVersion) {
+TEST_F(HelperTest, EvictionItemCanMarkAndCanEvictMatchStateVersionAndReference) {
   Frame frame;
 
-  // Bring frame to UNLOCKED and bump version once:
+  // Bring frame to UNLOCKED:
   auto sv = frame.state_and_version();
   ASSERT_TRUE(frame.try_lock_exclusive(sv));
   frame.unlock_exclusive();
@@ -51,26 +51,25 @@ TEST_F(HelperTest, EvictionItemCanMarkAndCanEvictMatchStateAndVersion) {
   ASSERT_EQ(Frame::state(unlocked_sv), Frame::UNLOCKED);
 
   const auto ts = Frame::version(unlocked_sv);
-
   const EvictionItem item{PageID{PageSizeType::KiB4, 0}, ts};
 
   // UNLOCKED + matching version => markable
   EXPECT_TRUE(item.can_mark(unlocked_sv));
-  EXPECT_FALSE(item.can_evict(unlocked_sv));
 
-  // MARKED + matching version => evictable
-  auto sv2 = frame.state_and_version();
-  ASSERT_TRUE(frame.try_mark(sv2));
-  const auto marked_sv = frame.state_and_version();
-  ASSERT_EQ(Frame::state(marked_sv), Frame::MARKED);
+  // Not referenced => evictable
+  EXPECT_TRUE(item.can_evict(unlocked_sv));
 
-  EXPECT_FALSE(item.can_mark(marked_sv));
-  EXPECT_TRUE(item.can_evict(marked_sv));
+  // If referenced => not evictable
+  frame.mark_referenced();
+  const auto ref_sv = frame.state_and_version();
+  ASSERT_EQ(Frame::state(ref_sv), Frame::UNLOCKED);
+  EXPECT_TRUE(item.can_mark(ref_sv));
+  EXPECT_FALSE(item.can_evict(ref_sv));
 
   // Version mismatch => neither markable nor evictable
   const EvictionItem wrong_ts{PageID{PageSizeType::KiB4, 0}, ts + 1};
   EXPECT_FALSE(wrong_ts.can_mark(unlocked_sv));
-  EXPECT_FALSE(wrong_ts.can_evict(marked_sv));
+  EXPECT_FALSE(wrong_ts.can_evict(unlocked_sv));
 }
 
 TEST_F(HelperTest, CreateMappedRegionReturnsAlignedPointerAndCanBeUnmapped) {

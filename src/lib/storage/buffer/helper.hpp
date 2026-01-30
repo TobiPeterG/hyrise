@@ -1,10 +1,13 @@
 #pragma once
 
 #include <tbb/concurrent_queue.h>
+
 #include <bit>
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <magic_enum.hpp>
+
 #include "boost/integer/static_log2.hpp"
 #include "frame.hpp"
 #include "metrics.hpp"
@@ -98,10 +101,11 @@ struct EvictionItem {
   // The page to be evicted.
   PageID page_id;
 
-  // Insertion timestamp for frame into the queue. Is compared with eviction_timestamp of frame.
+  // Timestamp is the masked version (Frame::version) at enqueue time.
   uint64_t timestamp;
 
-  // Check if the given frame can be evicted if it was marked before
+  // "can_mark" means "still the same frame generation and currently not exclusively locked"
+  // "can_evict" means "valid + unlocked-like + not referenced"
   bool can_evict(Frame::StateVersionType state_and_version) const;
 
   // Check if the given frame can be marked for eviction
@@ -112,16 +116,15 @@ using EvictionQueue = tbb::concurrent_queue<EvictionItem>;
 
 // Enable or or disable mprotect calls for debugging purposes
 constexpr bool ENABLE_MPROTECT = true;
-
 constexpr size_t MAX_EVICTION_QUEUE_PURGES = 1024;
 
 constexpr size_t DEFAULT_RESERVED_VIRTUAL_MEMORY = 1UL << 38;  // 256 GiB
 
-constexpr size_t DEFAULT_RESERVED_VIRTUAL_MEMORY_PER_REGION = (DEFAULT_RESERVED_VIRTUAL_MEMORY / NUM_PAGE_SIZE_TYPES) /
-                                                              bytes_for_size_type(MAX_PAGE_SIZE_TYPE) *
-                                                              bytes_for_size_type(MAX_PAGE_SIZE_TYPE);
+constexpr size_t DEFAULT_RESERVED_VIRTUAL_MEMORY_PER_REGION =
+    (DEFAULT_RESERVED_VIRTUAL_MEMORY / NUM_PAGE_SIZE_TYPES) / bytes_for_size_type(MAX_PAGE_SIZE_TYPE) *
+    bytes_for_size_type(MAX_PAGE_SIZE_TYPE);
 
-constexpr size_t INITIAL_SLOTS_PER_REGION = 10000000;  // TODO
+constexpr size_t INITIAL_SLOTS_PER_REGION = 10000000;
 
 // Hints the buffer manager about the access intent of the caller. This influences the migration strategy
 enum class AccessIntent { Read, Write };
@@ -153,4 +156,5 @@ std::array<std::shared_ptr<VolatileRegion>, NUM_PAGE_SIZE_TYPES> create_volatile
     std::byte* mapped_region, std::shared_ptr<BufferManagerMetrics> metrics);
 
 void unmap_region(std::byte* region);
+
 }  // namespace hyrise

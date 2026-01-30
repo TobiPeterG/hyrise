@@ -24,7 +24,7 @@ TEST_F(FrameTest, TestInitialStateIsEvicted) {
   EXPECT_EQ(frame.node_id(), Frame::node_id(sv));
 }
 
-TEST_F(FrameTest, TestExclusiveLockUnlockIncrementsVersion) {
+TEST_F(FrameTest, TestExclusiveLockUnlockDoesNotChangeVersion) {
   Frame frame;
 
   const auto before = frame.state_and_version();
@@ -37,12 +37,12 @@ TEST_F(FrameTest, TestExclusiveLockUnlockIncrementsVersion) {
   const auto locked = frame.state_and_version();
   EXPECT_EQ(Frame::state(locked), Frame::LOCKED);
 
-  // Unlock exclusive should set UNLOCKED and increment version by 1.
+  // Unlock exclusive should set UNLOCKED without incrementing version.
   frame.unlock_exclusive();
 
   const auto after = frame.state_and_version();
   EXPECT_EQ(Frame::state(after), Frame::UNLOCKED);
-  EXPECT_EQ(Frame::version(after), Frame::version(locked) + 1);
+  EXPECT_EQ(Frame::version(after), Frame::version(locked));
 }
 
 TEST_F(FrameTest, TestUnlockExclusiveAndSetEvictedIncrementsVersion) {
@@ -90,7 +90,7 @@ TEST_F(FrameTest, TestSharedLockCountingAndFinalUnlockSignal) {
   EXPECT_TRUE(frame.is_unlocked());
 }
 
-TEST_F(FrameTest, TestMarkThenSharedLockFromMarked) {
+TEST_F(FrameTest, TestReferenceBitsSaturateAndCanBeCleared) {
   Frame frame;
 
   // Move to UNLOCKED
@@ -99,22 +99,28 @@ TEST_F(FrameTest, TestMarkThenSharedLockFromMarked) {
   frame.unlock_exclusive();
   ASSERT_TRUE(frame.is_unlocked());
 
-  // Mark
-  auto sv = frame.state_and_version();
-  ASSERT_TRUE(frame.try_mark(sv));
+  EXPECT_EQ(frame.reference_level(), 0u);
 
-  const auto marked = frame.state_and_version();
-  EXPECT_EQ(Frame::state(marked), Frame::MARKED);
+  // Saturating increments up to 3
+  frame.mark_referenced();
+  EXPECT_EQ(frame.reference_level(), 1u);
 
-  auto sv2 = frame.state_and_version();
-  ASSERT_TRUE(frame.try_lock_shared(sv2));
+  frame.mark_referenced();
+  EXPECT_EQ(frame.reference_level(), 2u);
 
-  const auto shared1 = frame.state_and_version();
-  EXPECT_EQ(Frame::state(shared1), 1u);
+  frame.mark_referenced();
+  EXPECT_EQ(frame.reference_level(), 3u);
 
-  // Releasing should bring it back to UNLOCKED
-  EXPECT_TRUE(frame.unlock_shared());
-  EXPECT_TRUE(frame.is_unlocked());
+  frame.mark_referenced();
+  EXPECT_EQ(frame.reference_level(), 3u);
+
+  // Clear brings it back to 0
+  frame.clear_reference();
+  EXPECT_EQ(frame.reference_level(), 0u);
+
+  // set_reference_max sets to 3
+  frame.set_reference_max();
+  EXPECT_EQ(frame.reference_level(), 3u);
 }
 
 TEST_F(FrameTest, TestDirtyFlagSetAndReset) {

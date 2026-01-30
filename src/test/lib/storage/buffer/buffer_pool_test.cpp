@@ -207,7 +207,7 @@ TEST_P(BufferPoolTest, TestEnsureFreePagesFailsWhenEvictionQueueEmpty) {
   EXPECT_EQ(pool.used_bytes.load(std::memory_order_relaxed), pool_size);
 }
 
-TEST_P(BufferPoolTest, TestEnsureFreePagesEvictsMarkedPageToSSDAndFreesBudget) {
+TEST_P(BufferPoolTest, TestEnsureFreePagesEvictsUnreferencedPageToSSDAndFreesBudget) {
   BufferPoolTestContext ctx;
 
   const auto pool_size = bytes_for_size_type(PageSizeType::KiB4);  // only 1 page fits
@@ -236,6 +236,9 @@ TEST_P(BufferPoolTest, TestEnsureFreePagesEvictsMarkedPageToSSDAndFreesBudget) {
     touch_page(ptr);
     frame->unlock_exclusive();  // increments version and leaves UNLOCKED
   }
+
+  // Make sure the victim is not referenced, so we will allow eviction.
+  frame->clear_reference();
 
   // Occupy pool budget with one page (now used_bytes == max_bytes)
   EXPECT_TRUE(pool.ensure_free_pages(PageSizeType::KiB4));
