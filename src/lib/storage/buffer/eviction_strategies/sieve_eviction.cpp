@@ -2,7 +2,14 @@
 
 #include <storage/buffer/buffer_pool.hpp>
 
+#include "storage/buffer/eviction_strategy_registry.hpp"
+
 namespace hyrise {
+
+namespace {
+EvictionStrategyRegistrar s_sieve_registrar{
+    "sieve", [](BufferPool& buffer_pool) { return std::make_unique<SieveEviction>(buffer_pool); }, {"SIEVE"}};
+}  // namespace
 
 SieveEviction::SieveEviction(BufferPool& buffer_pool) : EvictionStrategy(buffer_pool), _hand(0) {}
 
@@ -65,7 +72,7 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
     }
 
     Assert(frame->node_id() == _buffer_pool.node_id,
-      "Memory node mismatch: " + std::to_string(frame->node_id()) + " != " + std::to_string(_buffer_pool.node_id));
+           "Memory node mismatch: " + std::to_string(frame->node_id()) + " != " + std::to_string(_buffer_pool.node_id));
 
     _hand.fetch_add(1, std::memory_order_relaxed);
 
@@ -119,7 +126,8 @@ void SieveEviction::purge_eviction_candidates() {
 }
 
 std::size_t SieveEviction::memory_consumption() const {
-  return sizeof(*this) + sizeof(_eviction_vector) + sizeof(tbb::concurrent_vector<EvictionQueue>::value_type) * _eviction_vector.size();
+  return sizeof(*this) + sizeof(_eviction_vector) +
+         sizeof(tbb::concurrent_vector<EvictionQueue>::value_type) * _eviction_vector.size();
 }
 
 }  // namespace hyrise

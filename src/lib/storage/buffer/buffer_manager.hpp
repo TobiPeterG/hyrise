@@ -36,6 +36,9 @@ class BufferManager : public boost::container::pmr::memory_resource, public Nonc
 
     bool enable_numa = false;
 
+    // Eviction strategy to use (default: "second-chance").
+    std::string eviction_strategy = "second-chance";
+
     // Path to the SSD storage. Can be a block device or a directory. (default: ~/.hyrise).
     std::filesystem::path ssd_path = "~/.hyrise";
 

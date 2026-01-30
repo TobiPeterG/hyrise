@@ -1,10 +1,12 @@
 #include <filesystem>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <vector>
 
 #include "base_test.hpp"
 #include "storage/buffer/buffer_manager.hpp"
+#include "storage/buffer/eviction_strategy_registry.hpp"
 #include "storage/buffer/helper.hpp"
 
 #if HYRISE_NUMA_SUPPORT
@@ -27,7 +29,45 @@ class TestBufferManager final : public BufferManager {
   }
 };
 
-class BufferManagerMigrationPolicyTest : public BaseTest {
+namespace {
+
+// GTest parameter names must match [A-Za-z0-9_]+.
+// We normalize strategy names similarly to the registry: lowercase + separators to '_'.
+static std::string gtest_param_name(std::string s) {
+  std::string out;
+  out.reserve(s.size());
+
+  bool last_was_sep = false;
+  for (const auto ch : s) {
+    const auto c = static_cast<unsigned char>(ch);
+    if (std::isalnum(c)) {
+      out.push_back(static_cast<char>(std::tolower(c)));
+      last_was_sep = false;
+    } else {
+      if (!out.empty() && !last_was_sep) {
+        out.push_back('_');
+        last_was_sep = true;
+      }
+    }
+  }
+
+  while (!out.empty() && out.back() == '_') {
+    out.pop_back();
+  }
+
+  if (out.empty()) {
+    out = "unknown";
+  }
+  return out;
+}
+
+static std::vector<std::string> registered_eviction_strategies() {
+  return EvictionStrategyRegistry::instance().available_names();
+}
+
+}  // namespace
+
+class BufferManagerMigrationPolicyTest : public BaseTest, public ::testing::WithParamInterface<std::string> {
  protected:
   void SetUp() override {
     // Always set up the SSD directory, regardless of NUMA availability.
@@ -72,7 +112,7 @@ static void require_two_numa_nodes_or_skip() {
   } while (false)
 
 static TestBufferManager create_buffer_manager(const std::filesystem::path& ssd_dir, const size_t buffer_pool_size,
-                                               const MigrationPolicy& policy) {
+                                               const MigrationPolicy& policy, const std::string& eviction_strategy) {
   auto config = BufferManager::Config{};
   config.dram_buffer_pool_size = buffer_pool_size;
   config.numa_buffer_pool_size = buffer_pool_size;
@@ -86,11 +126,15 @@ static TestBufferManager create_buffer_manager(const std::filesystem::path& ssd_
 
   config.migration_policy = policy;
 
+  config.eviction_strategy = eviction_strategy;
+
   return TestBufferManager{config};
 }
 
-static TestBufferManager create_buffer_manager_no_numa(const std::filesystem::path& ssd_dir, const size_t buffer_pool_size,
-                                                       const MigrationPolicy& policy) {
+static TestBufferManager create_buffer_manager_no_numa(const std::filesystem::path& ssd_dir,
+                                                       const size_t buffer_pool_size,
+                                                       const MigrationPolicy& policy,
+                                                       const std::string& eviction_strategy) {
   auto config = BufferManager::Config{};
   config.dram_buffer_pool_size = buffer_pool_size;
   config.numa_buffer_pool_size = buffer_pool_size;  // unused when NUMA disabled
@@ -104,6 +148,8 @@ static TestBufferManager create_buffer_manager_no_numa(const std::filesystem::pa
   config.memory_node = NodeID{0};
 
   config.migration_policy = policy;
+
+  config.eviction_strategy = eviction_strategy;
 
   return TestBufferManager{config};
 }
@@ -163,11 +209,12 @@ static size_t count_allocations_on_node(TestBufferManager& bm, const NodeID node
  */
 static size_t count_allocations_on_node_in_fresh_thread(const std::filesystem::path& ssd_dir, const size_t pool_size,
                                                         const MigrationPolicy& policy, const NodeID node,
-                                                        const size_t iterations) {
+                                                        const size_t iterations,
+                                                        const std::string& eviction_strategy) {
   size_t result = 0;
 
   std::thread t([&]() {
-    auto bm = create_buffer_manager(ssd_dir, pool_size, policy);
+    auto bm = create_buffer_manager(ssd_dir, pool_size, policy, eviction_strategy);
     result = count_allocations_on_node(bm, node, iterations);
   });
 
@@ -176,8 +223,9 @@ static size_t count_allocations_on_node_in_fresh_thread(const std::filesystem::p
 }
 
 static size_t count_allocations_on_dram_when_no_numa(const std::filesystem::path& ssd_dir, const size_t pool_size,
-                                                     const MigrationPolicy& policy, const size_t iterations) {
-  auto bm = create_buffer_manager_no_numa(ssd_dir, pool_size, policy);
+                                                     const MigrationPolicy& policy, const size_t iterations,
+                                                     const std::string& eviction_strategy) {
+  auto bm = create_buffer_manager_no_numa(ssd_dir, pool_size, policy, eviction_strategy);
 
   constexpr auto alignment = PAGE_ALIGNMENT;
   constexpr auto size_type = PageSizeType::KiB8;
@@ -219,7 +267,7 @@ static size_t count_allocations_on_dram_when_no_numa(const std::filesystem::path
   return on_dram;
 }
 
-TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementRespectsMigrationPolicyExtremes) {
+TEST_P(BufferManagerMigrationPolicyTest, TestAllocationPlacementRespectsMigrationPolicyExtremes) {
   REQUIRE_TWO_NUMA_NODES_OR_RETURN();
 
   constexpr size_t iterations = 200;
@@ -255,9 +303,9 @@ TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementRespectsMigratio
   const NodeID dram_node{0};
 
   const auto r0_on_dram =
-      count_allocations_on_node_in_fresh_thread(_ssd_dir, pool_size, policy_ratio_0, dram_node, iterations);
+      count_allocations_on_node_in_fresh_thread(_ssd_dir, pool_size, policy_ratio_0, dram_node, iterations, GetParam());
   const auto r1_on_dram =
-      count_allocations_on_node_in_fresh_thread(_ssd_dir, pool_size, policy_ratio_1, dram_node, iterations);
+      count_allocations_on_node_in_fresh_thread(_ssd_dir, pool_size, policy_ratio_1, dram_node, iterations, GetParam());
 
   // Extremes must differ
   EXPECT_NE(r0_on_dram, r1_on_dram) << "dram_write_ratio=0 and 1 should result in opposite allocation behavior";
@@ -270,7 +318,7 @@ TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementRespectsMigratio
       << "dram_write_ratio=1 should produce deterministic placement, got on_dram=" << r1_on_dram;
 }
 
-TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementVariesWithIntermediateDramWriteRatios) {
+TEST_P(BufferManagerMigrationPolicyTest, TestAllocationPlacementVariesWithIntermediateDramWriteRatios) {
   REQUIRE_TWO_NUMA_NODES_OR_RETURN();
 
   // Use a few more iterations so that intermediate ratios have a good chance to yield both outcomes.
@@ -287,7 +335,7 @@ TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementVariesWithInterm
                                  /*numa_read*/ 0.0,
                                  /*numa_write*/ 0.0,
                                  /*seed*/ seed};
-    return count_allocations_on_node_in_fresh_thread(_ssd_dir, pool_size, policy, dram_node, iterations);
+    return count_allocations_on_node_in_fresh_thread(_ssd_dir, pool_size, policy, dram_node, iterations, GetParam());
   };
 
   const auto on_dram_r10 = run(1.0, 101);
@@ -320,7 +368,7 @@ TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementVariesWithInterm
   EXPECT_LE(on_dram_r75, on_dram_r10);
 }
 
-TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementWithoutNumaAlwaysUsesDram) {
+TEST_P(BufferManagerMigrationPolicyTest, TestAllocationPlacementWithoutNumaAlwaysUsesDram) {
   // This test intentionally does NOT require real NUMA support.
   // It verifies that in DRAM+SSD mode (NUMA disabled), allocations always use DRAM
   // regardless of MigrationPolicy ratios.
@@ -340,11 +388,18 @@ TEST_F(BufferManagerMigrationPolicyTest, TestAllocationPlacementWithoutNumaAlway
                                        /*numa_write*/ 0.0,
                                        /*seed*/ 42};
 
-  const auto r0_on_dram = count_allocations_on_dram_when_no_numa(_ssd_dir, pool_size, policy_ratio_0, iterations);
-  const auto r1_on_dram = count_allocations_on_dram_when_no_numa(_ssd_dir, pool_size, policy_ratio_1, iterations);
+  const auto r0_on_dram =
+      count_allocations_on_dram_when_no_numa(_ssd_dir, pool_size, policy_ratio_0, iterations, GetParam());
+  const auto r1_on_dram =
+      count_allocations_on_dram_when_no_numa(_ssd_dir, pool_size, policy_ratio_1, iterations, GetParam());
 
   EXPECT_EQ(r0_on_dram, iterations);
   EXPECT_EQ(r1_on_dram, iterations);
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    RegisteredEvictionStrategies, BufferManagerMigrationPolicyTest,
+    ::testing::ValuesIn(registered_eviction_strategies()),
+    [](const ::testing::TestParamInfo<std::string>& info) { return gtest_param_name(info.param); });
 
 }  // namespace hyrise

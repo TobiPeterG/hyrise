@@ -6,6 +6,8 @@
 #include "storage/buffer/ssd_region.hpp"
 #include "volatile_region.hpp"
 
+#include "storage/buffer/eviction_strategy_registry.hpp"
+
 #ifndef NDEBUG
 #include <iostream>
 #include <sstream>
@@ -23,8 +25,8 @@ namespace hyrise {
 BufferPool::BufferPool(const bool enabled, const size_t pool_size, const bool enable_eviction_purge_worker,
                        std::array<std::shared_ptr<VolatileRegion>, NUM_PAGE_SIZE_TYPES> volatile_regions,
                        MigrationPolicy migration_policy, std::shared_ptr<SSDRegion> ssd_region,
-                       std::shared_ptr<BufferPool> target_buffer_pool, const NodeID numa_node,
-                       std::shared_ptr<BufferPoolMetrics> metrics)
+                       std::shared_ptr<BufferPool> target_buffer_pool, const std::string& eviction_strategy_name,
+                       const NodeID numa_node, std::shared_ptr<BufferPoolMetrics> metrics)
     : max_bytes(pool_size),
       used_bytes(0),
       metrics(metrics),
@@ -33,12 +35,13 @@ BufferPool::BufferPool(const bool enabled, const size_t pool_size, const bool en
       node_id(numa_node),
       ssd_region(ssd_region),
       target_buffer_pool(target_buffer_pool),
-      eviction_strategy(std::make_unique<SieveEviction>(*this)),
+      eviction_strategy(EvictionStrategyRegistry::instance().create(eviction_strategy_name, *this)),
       migration_policy(migration_policy),
-      eviction_purge_worker(enable_eviction_purge_worker
-                                ? std::make_unique<PausableLoopThread>(IDLE_EVICTION_QUEUE_PURGE,
-                                                                       [&](size_t) { eviction_strategy->purge_eviction_candidates(); })
-                                : nullptr) {}
+      eviction_purge_worker(
+          enable_eviction_purge_worker
+              ? std::make_unique<PausableLoopThread>(IDLE_EVICTION_QUEUE_PURGE,
+                                                     [&](size_t) { eviction_strategy->purge_eviction_candidates(); })
+              : nullptr) {}
 
 #ifndef NDEBUG
 static std::string debug_backtrace() {
@@ -84,16 +87,14 @@ void BufferPool::free_bytes(const uint64_t bytes) {
   const auto before = used_bytes.load(std::memory_order_relaxed);
   if (before < bytes) {
     std::ostringstream oss;
-    oss << "BufferPool::free_bytes underflow: before=" << before
-        << " sub=" << bytes
-        << " max_bytes=" << max_bytes
-        << " node_id=" << node_id
-        << " enabled=" << enabled;
+    oss << "BufferPool::free_bytes underflow: before=" << before << " sub=" << bytes << " max_bytes=" << max_bytes
+        << " node_id=" << node_id << " enabled=" << enabled;
 
     // Best-effort backtrace
     std::vector<void*> addrs(64);
     const auto n = ::backtrace(addrs.data(), static_cast<int>(addrs.size()));
-    if (n > 0) addrs.resize(static_cast<size_t>(n));
+    if (n > 0)
+      addrs.resize(static_cast<size_t>(n));
     char** syms = ::backtrace_symbols(addrs.data(), static_cast<int>(addrs.size()));
     if (syms) {
       oss << "\nBacktrace:";
@@ -122,12 +123,8 @@ uint64_t BufferPool::reserve_bytes(const uint64_t bytes) {
 #ifndef NDEBUG
   const auto after = before + bytes;
   if (after > max_bytes + (bytes_for_size_type(MAX_PAGE_SIZE_TYPE) * 4)) {
-    std::cerr << "[BM][DEBUG] reserve_bytes large oversubscription: before=" << before
-              << " add=" << bytes
-              << " after=" << after
-              << " max_bytes=" << max_bytes
-              << " node_id=" << node_id
-              << "\n";
+    std::cerr << "[BM][DEBUG] reserve_bytes large oversubscription: before=" << before << " add=" << bytes
+              << " after=" << after << " max_bytes=" << max_bytes << " node_id=" << node_id << "\n";
   }
 #endif
 

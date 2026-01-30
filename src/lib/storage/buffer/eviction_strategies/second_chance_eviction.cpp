@@ -1,6 +1,15 @@
 #include "second_chance_eviction.hpp"
 
+#include "storage/buffer/eviction_strategy_registry.hpp"
+
 namespace hyrise {
+
+namespace {
+EvictionStrategyRegistrar s_second_chance_registrar{
+    "second_chance",
+    [](BufferPool& buffer_pool) { return std::make_unique<SecondChanceEviction>(buffer_pool); },
+    {"second chance", "second-chance", "2nd_chance", "2nd chance"}};
+}  // namespace
 
 SecondChanceEviction::SecondChanceEviction(BufferPool& buffer_pool) : EvictionStrategy(buffer_pool) {}
 
@@ -13,7 +22,7 @@ void SecondChanceEviction::add_eviction_candidate(const PageID& page_id, Frame* 
 }
 
 bool SecondChanceEviction::perform_evictions(const PageSizeType required_size) {
-// TODO: Free at least 64 * PageSite bytes to reduce TLB shootdowns
+  // TODO: Free at least 64 * PageSite bytes to reduce TLB shootdowns
   const auto bytes_required = bytes_for_size_type(required_size);
   auto freed_bytes = size_t{0};
 
@@ -29,10 +38,8 @@ bool SecondChanceEviction::perform_evictions(const PageSizeType required_size) {
       std::cerr << "[BM][DEBUG] ensure_free_pages failed: eviction_queue empty"
                 << " required_bytes=" << bytes_required
                 << " used_bytes=" << _buffer_pool.used_bytes.load(std::memory_order_relaxed)
-                << " max_bytes=" << _buffer_pool.max_bytes
-                << " freed_bytes=" << freed_bytes
-                << " node_id=" << _buffer_pool.node_id
-                << "\n";
+                << " max_bytes=" << _buffer_pool.max_bytes << " freed_bytes=" << freed_bytes
+                << " node_id=" << _buffer_pool.node_id << "\n";
 #endif
       _buffer_pool.free_bytes(bytes_required);  // TODO: Check if this is correct
       return false;

@@ -113,6 +113,9 @@ BufferManager::Config BufferManager::Config::from_env() {
         migration_policy_json.value("dram_write_ratio", config.migration_policy.get_dram_write_ratio()),
         migration_policy_json.value("numa_read_ratio", config.migration_policy.get_numa_read_ratio()),
         migration_policy_json.value("numa_write_ratio", config.migration_policy.get_numa_write_ratio())};
+
+    config.eviction_strategy = json.value("eviction_strategy", config.eviction_strategy);
+
     config.enable_eviction_purge_worker =
         json.value("enable_eviction_purge_worker", config.enable_eviction_purge_worker);
     config.memory_node = static_cast<NodeID>(json.value("memory_node", static_cast<int64_t>(config.memory_node)));
@@ -134,6 +137,9 @@ nlohmann::json BufferManager::Config::to_json() const {
   json["migration_policy"]["dram_write_ratio"] = migration_policy.get_dram_write_ratio();
   json["migration_policy"]["numa_read_ratio"] = migration_policy.get_numa_read_ratio();
   json["migration_policy"]["numa_write_ratio"] = migration_policy.get_numa_write_ratio();
+
+  json["eviction_strategy"] = eviction_strategy;
+
   json["enable_eviction_purge_worker"] = enable_eviction_purge_worker;
   json["memory_node"] = static_cast<int64_t>(memory_node);
   return json;
@@ -151,13 +157,14 @@ BufferManager::BufferManager(const Config config)
       _metrics(std::make_shared<BufferManagerMetrics>()),
       _volatile_regions(create_volatile_regions(_mapped_region, _metrics)),
       _ssd_region(std::make_shared<SSDRegion>(config.ssd_path, _metrics)),
-      _primary_buffer_pool(std::make_shared<BufferPool>(
-          true, config.dram_buffer_pool_size, config.enable_eviction_purge_worker, _volatile_regions,
-          config.migration_policy, _ssd_region, nullptr, config.cpu_node, _metrics->dram_buffer_pool_metrics)),
-      _secondary_buffer_pool(std::make_shared<BufferPool>(config.enable_numa, config.numa_buffer_pool_size,
-                                                          config.enable_eviction_purge_worker, _volatile_regions,
-                                                          config.migration_policy, _ssd_region, _primary_buffer_pool,
-                                                          config.memory_node, _metrics->numa_buffer_pool_metrics)) {
+      _primary_buffer_pool(
+          std::make_shared<BufferPool>(true, config.dram_buffer_pool_size, config.enable_eviction_purge_worker,
+                                       _volatile_regions, config.migration_policy, _ssd_region, nullptr,
+                                       config.eviction_strategy, config.cpu_node, _metrics->dram_buffer_pool_metrics)),
+      _secondary_buffer_pool(std::make_shared<BufferPool>(
+          config.enable_numa, config.numa_buffer_pool_size, config.enable_eviction_purge_worker, _volatile_regions,
+          config.migration_policy, _ssd_region, _primary_buffer_pool, config.eviction_strategy, config.memory_node,
+          _metrics->numa_buffer_pool_metrics)) {
 #ifndef NDEBUG
   bump_mapping_epoch();
 #endif

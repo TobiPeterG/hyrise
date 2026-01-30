@@ -2,10 +2,13 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "base_test.hpp"
 
 #include "storage/buffer/buffer_pool.hpp"
+#include "storage/buffer/eviction_strategy_registry.hpp"
 #include "storage/buffer/helper.hpp"
 #include "storage/buffer/metrics.hpp"
 #include "storage/buffer/ssd_region.hpp"
@@ -17,7 +20,7 @@
 
 namespace hyrise {
 
-class BufferPoolTest : public BaseTest {};
+class BufferPoolTest : public BaseTest, public ::testing::WithParamInterface<std::string> {};
 
 namespace {
 
@@ -63,9 +66,39 @@ static void touch_page(std::byte* ptr) {
   v[0] = std::byte{0xAB};
 }
 
+// GTest parameter names must match [A-Za-z0-9_]+.
+// We normalize strategy names similarly to the registry: lowercase + separators to '_'.
+static std::string gtest_param_name(std::string s) {
+  std::string out;
+  out.reserve(s.size());
+
+  bool last_was_sep = false;
+  for (const auto ch : s) {
+    const auto c = static_cast<unsigned char>(ch);
+    if (std::isalnum(c)) {
+      out.push_back(static_cast<char>(std::tolower(c)));
+      last_was_sep = false;
+    } else {
+      if (!out.empty() && !last_was_sep) {
+        out.push_back('_');
+        last_was_sep = true;
+      }
+    }
+  }
+
+  while (!out.empty() && out.back() == '_') {
+    out.pop_back();
+  }
+
+  if (out.empty()) {
+    out = "unknown";
+  }
+  return out;
+}
+
 }  // namespace
 
-TEST_F(BufferPoolTest, TestReserveAndFreeBytesAccounting) {
+TEST_P(BufferPoolTest, TestReserveAndFreeBytesAccounting) {
   BufferPoolTestContext ctx;
 
   BufferPool pool{/*enabled*/ true,
@@ -75,6 +108,7 @@ TEST_F(BufferPoolTest, TestReserveAndFreeBytesAccounting) {
                   /*migration_policy*/ EagerMigrationPolicy,
                   /*ssd_region*/ ctx.ssd_region,
                   /*target_buffer_pool*/ nullptr,
+                  /*eviction_strategy_name*/ GetParam(),
                   /*numa_node*/ NodeID{0},
                   /*metrics*/ ctx.pool_metrics};
 
@@ -91,7 +125,7 @@ TEST_F(BufferPoolTest, TestReserveAndFreeBytesAccounting) {
   EXPECT_EQ(pool.used_bytes.load(std::memory_order_relaxed), 1000u);
 }
 
-TEST_F(BufferPoolTest, TestAddToEvictionQueueIncrementsMetric) {
+TEST_P(BufferPoolTest, TestAddToEvictionQueueIncrementsMetric) {
   BufferPoolTestContext ctx;
 
   BufferPool pool{/*enabled*/ true,
@@ -101,6 +135,7 @@ TEST_F(BufferPoolTest, TestAddToEvictionQueueIncrementsMetric) {
                   /*migration_policy*/ EagerMigrationPolicy,
                   /*ssd_region*/ ctx.ssd_region,
                   /*target_buffer_pool*/ nullptr,
+                  /*eviction_strategy_name*/ GetParam(),
                   /*numa_node*/ NodeID{0},
                   /*metrics*/ ctx.pool_metrics};
 
@@ -126,7 +161,7 @@ TEST_F(BufferPoolTest, TestAddToEvictionQueueIncrementsMetric) {
   region->deallocate(page_id);
 }
 
-TEST_F(BufferPoolTest, TestEnsureFreePagesReturnsTrueWhenNoPressure) {
+TEST_P(BufferPoolTest, TestEnsureFreePagesReturnsTrueWhenNoPressure) {
   BufferPoolTestContext ctx;
 
   BufferPool pool{/*enabled*/ true,
@@ -136,6 +171,7 @@ TEST_F(BufferPoolTest, TestEnsureFreePagesReturnsTrueWhenNoPressure) {
                   /*migration_policy*/ EagerMigrationPolicy,
                   /*ssd_region*/ ctx.ssd_region,
                   /*target_buffer_pool*/ nullptr,
+                  /*eviction_strategy_name*/ GetParam(),
                   /*numa_node*/ NodeID{0},
                   /*metrics*/ ctx.pool_metrics};
 
@@ -147,7 +183,7 @@ TEST_F(BufferPoolTest, TestEnsureFreePagesReturnsTrueWhenNoPressure) {
   EXPECT_EQ(after, before + bytes_for_size_type(PageSizeType::KiB4));
 }
 
-TEST_F(BufferPoolTest, TestEnsureFreePagesFailsWhenEvictionQueueEmpty) {
+TEST_P(BufferPoolTest, TestEnsureFreePagesFailsWhenEvictionQueueEmpty) {
   BufferPoolTestContext ctx;
 
   const auto pool_size = bytes_for_size_type(PageSizeType::KiB4);  // tiny
@@ -158,6 +194,7 @@ TEST_F(BufferPoolTest, TestEnsureFreePagesFailsWhenEvictionQueueEmpty) {
                   /*migration_policy*/ EagerMigrationPolicy,
                   /*ssd_region*/ ctx.ssd_region,
                   /*target_buffer_pool*/ nullptr,
+                  /*eviction_strategy_name*/ GetParam(),
                   /*numa_node*/ NodeID{0},
                   /*metrics*/ ctx.pool_metrics};
 
@@ -170,7 +207,7 @@ TEST_F(BufferPoolTest, TestEnsureFreePagesFailsWhenEvictionQueueEmpty) {
   EXPECT_EQ(pool.used_bytes.load(std::memory_order_relaxed), pool_size);
 }
 
-TEST_F(BufferPoolTest, TestEnsureFreePagesEvictsMarkedPageToSSDAndFreesBudget) {
+TEST_P(BufferPoolTest, TestEnsureFreePagesEvictsMarkedPageToSSDAndFreesBudget) {
   BufferPoolTestContext ctx;
 
   const auto pool_size = bytes_for_size_type(PageSizeType::KiB4);  // only 1 page fits
@@ -181,6 +218,7 @@ TEST_F(BufferPoolTest, TestEnsureFreePagesEvictsMarkedPageToSSDAndFreesBudget) {
                   /*migration_policy*/ EagerMigrationPolicy,
                   /*ssd_region*/ ctx.ssd_region,
                   /*target_buffer_pool*/ nullptr,
+                  /*eviction_strategy_name*/ GetParam(),
                   /*numa_node*/ NodeID{0},
                   /*metrics*/ ctx.pool_metrics};
 
@@ -228,7 +266,7 @@ TEST_F(BufferPoolTest, TestEnsureFreePagesEvictsMarkedPageToSSDAndFreesBudget) {
   region->deallocate(page_id);
 }
 
-TEST_F(BufferPoolTest, TestPurgeEvictionQueueKeepsEvictableOrMarkableItems) {
+TEST_P(BufferPoolTest, TestPurgeEvictionQueueKeepsEvictableOrMarkableItems) {
   BufferPoolTestContext ctx;
 
   BufferPool pool{/*enabled*/ true,
@@ -238,6 +276,7 @@ TEST_F(BufferPoolTest, TestPurgeEvictionQueueKeepsEvictableOrMarkableItems) {
                   /*migration_policy*/ EagerMigrationPolicy,
                   /*ssd_region*/ ctx.ssd_region,
                   /*target_buffer_pool*/ nullptr,
+                  /*eviction_strategy_name*/ GetParam(),
                   /*numa_node*/ NodeID{0},
                   /*metrics*/ ctx.pool_metrics};
 
@@ -272,5 +311,14 @@ TEST_F(BufferPoolTest, TestPurgeEvictionQueueKeepsEvictableOrMarkableItems) {
 
   region->deallocate(page_id);
 }
+
+// Instantiate tests for every registered strategy.
+static std::vector<std::string> registered_eviction_strategies() {
+  return EvictionStrategyRegistry::instance().available_names();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    RegisteredEvictionStrategies, BufferPoolTest, ::testing::ValuesIn(registered_eviction_strategies()),
+    [](const ::testing::TestParamInfo<std::string>& info) { return gtest_param_name(info.param); });
 
 }  // namespace hyrise

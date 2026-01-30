@@ -1,10 +1,12 @@
 #pragma once
 
+#include "storage/buffer/helper.hpp"
+
 namespace hyrise {
 struct BufferPool;
 
 class EvictionStrategy {
-public:
+ public:
   explicit EvictionStrategy(BufferPool& buffer_pool);
   virtual ~EvictionStrategy() = default;
   virtual bool perform_evictions(PageSizeType required_size) = 0;
@@ -12,7 +14,7 @@ public:
   virtual void purge_eviction_candidates() = 0;
   virtual std::size_t memory_consumption() const = 0;
 
-protected:
+ protected:
   BufferPool& _buffer_pool;
 };
 
