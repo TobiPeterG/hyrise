@@ -51,7 +51,7 @@ TEST_F(HelperTest, EvictionItemCanMarkAndCanEvictMatchStateVersionAndReference) 
   ASSERT_EQ(Frame::state(unlocked_sv), Frame::UNLOCKED);
 
   const auto ts = Frame::version(unlocked_sv);
-  const EvictionItem item{PageID{PageSizeType::KiB4, 0}, ts};
+  const EvictionItem item{PageID{MIN_PAGE_SIZE_TYPE, 0}, ts};
 
   // UNLOCKED + matching version => markable
   EXPECT_TRUE(item.can_mark(unlocked_sv));
@@ -60,14 +60,14 @@ TEST_F(HelperTest, EvictionItemCanMarkAndCanEvictMatchStateVersionAndReference) 
   EXPECT_TRUE(item.can_evict(unlocked_sv));
 
   // If referenced => not evictable
-  frame.mark_referenced();
+  frame.set_reference_level(1);
   const auto ref_sv = frame.state_and_version();
   ASSERT_EQ(Frame::state(ref_sv), Frame::UNLOCKED);
   EXPECT_TRUE(item.can_mark(ref_sv));
   EXPECT_FALSE(item.can_evict(ref_sv));
 
   // Version mismatch => neither markable nor evictable
-  const EvictionItem wrong_ts{PageID{PageSizeType::KiB4, 0}, ts + 1};
+  const EvictionItem wrong_ts{PageID{MIN_PAGE_SIZE_TYPE, 0}, ts + 1};
   EXPECT_FALSE(wrong_ts.can_mark(unlocked_sv));
   EXPECT_FALSE(wrong_ts.can_evict(unlocked_sv));
 }

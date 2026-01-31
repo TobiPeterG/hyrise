@@ -29,19 +29,29 @@ class Frame {
 
   NodeID node_id() const;
 
-  // ------------------------------------------------------------
-  // Reference bits for eviction strategies
-  // ------------------------------------------------------------
-  // 2-bit saturating counter in [0..3].
-  // - mark_referenced(): saturating increment
-  // - clear_reference(): set to 0 (used when scanned)
+  // Reference/frequency counter stored in REF_MASK (2-bit saturating counter in [0..3]).
+  // Only eviction strategies should manipulate this.
   uint8_t reference_level() const;
-  void mark_referenced();    // saturating increment (0->1->2->3)
-  void set_reference_max();  // set to 3
-  void clear_reference();    // set to 0
+  static uint8_t reference_level(StateVersionType state_and_version);
+
+  // Set reference level to an exact value (clamped by caller).
+  void set_reference_level(uint8_t level);
+
+  // Saturating increment with a caller-provided max (<= 3).
+  void inc_reference_level_saturating(uint8_t max_level);
+
+  // Decrement if > 0
+  void dec_reference_level_if_positive();
+
+  // Clear to 0.
+  void clear_reference();
 
   // Fast check on raw state_and_version
   static bool is_referenced(StateVersionType state_and_version);
+
+  // Per-frame last-access timestamp
+  uint32_t last_access_time() const;
+  void set_last_access_time(uint32_t t);
 
   // State transitions
   void unlock_exclusive_and_set_evicted();
@@ -88,6 +98,9 @@ class Frame {
                                                        StateVersionType new_state);
 
   std::atomic<StateVersionType> _state_and_version;
+
+  // Logical timestamp, updated by eviction strategies on access.
+  std::atomic<uint32_t> _last_access_time{0};
 };
 
 }  // namespace hyrise

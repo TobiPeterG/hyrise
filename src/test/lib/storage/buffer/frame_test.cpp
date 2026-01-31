@@ -102,24 +102,24 @@ TEST_F(FrameTest, TestReferenceBitsSaturateAndCanBeCleared) {
   EXPECT_EQ(frame.reference_level(), 0u);
 
   // Saturating increments up to 3
-  frame.mark_referenced();
+  frame.inc_reference_level_saturating(3);
   EXPECT_EQ(frame.reference_level(), 1u);
 
-  frame.mark_referenced();
+  frame.inc_reference_level_saturating(3);
   EXPECT_EQ(frame.reference_level(), 2u);
 
-  frame.mark_referenced();
+  frame.inc_reference_level_saturating(3);
   EXPECT_EQ(frame.reference_level(), 3u);
 
-  frame.mark_referenced();
+  frame.inc_reference_level_saturating(3);
   EXPECT_EQ(frame.reference_level(), 3u);
 
   // Clear brings it back to 0
   frame.clear_reference();
   EXPECT_EQ(frame.reference_level(), 0u);
 
-  // set_reference_max sets to 3
-  frame.set_reference_max();
+  // Set exact reference level to 3
+  frame.set_reference_level(3);
   EXPECT_EQ(frame.reference_level(), 3u);
 }
 

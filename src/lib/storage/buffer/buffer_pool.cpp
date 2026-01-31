@@ -1,7 +1,11 @@
 #include "buffer_pool.hpp"
 
+#include <storage/buffer/eviction_strategies/delayed_fifo_reinsertion_eviction.hpp>
 #include <storage/buffer/eviction_strategies/second_chance_eviction.hpp>
 #include <storage/buffer/eviction_strategies/sieve_eviction.hpp>
+
+#include <algorithm>
+
 #include "metrics.hpp"
 #include "storage/buffer/ssd_region.hpp"
 #include "volatile_region.hpp"
@@ -21,7 +25,7 @@
 #endif
 
 namespace hyrise {
-//TODO: properly check if disabled or not
+// TODO: properly check if disabled or not
 BufferPool::BufferPool(const bool enabled, const size_t pool_size, const bool enable_eviction_purge_worker,
                        std::array<std::shared_ptr<VolatileRegion>, NUM_PAGE_SIZE_TYPES> volatile_regions,
                        MigrationPolicy migration_policy, std::shared_ptr<SSDRegion> ssd_region,
@@ -29,6 +33,7 @@ BufferPool::BufferPool(const bool enabled, const size_t pool_size, const bool en
                        const NodeID numa_node, std::shared_ptr<BufferPoolMetrics> metrics)
     : max_bytes(pool_size),
       used_bytes(0),
+      resident_objects(0),
       metrics(metrics),
       enabled(enabled),
       volatile_regions(volatile_regions),
@@ -41,37 +46,120 @@ BufferPool::BufferPool(const bool enabled, const size_t pool_size, const bool en
           enable_eviction_purge_worker
               ? std::make_unique<PausableLoopThread>(IDLE_EVICTION_QUEUE_PURGE,
                                                      [&](size_t) { eviction_strategy->purge_eviction_candidates(); })
-              : nullptr) {}
-
-#ifndef NDEBUG
-static std::string debug_backtrace() {
-#if HYRISE_HAS_EXECINFO
-  std::vector<void*> addrs(64);
-  const auto n = ::backtrace(addrs.data(), static_cast<int>(addrs.size()));
-  if (n <= 0) {
-    return "(backtrace failed)";
-  }
-  addrs.resize(static_cast<size_t>(n));
-
-  char** syms = ::backtrace_symbols(addrs.data(), static_cast<int>(addrs.size()));
-  if (!syms) {
-    return "(backtrace_symbols failed)";
-  }
-
-  std::ostringstream oss;
-  for (size_t i = 0; i < addrs.size(); ++i) {
-    oss << "\n  " << syms[i];
-  }
-  std::free(syms);
-  return oss.str();
-#else
-  return "(no execinfo.h available)";
-#endif
+              : nullptr) {
+  // Initialize cached approximation once.
+  _recompute_cache_now();
 }
+
+void BufferPool::_maybe_recompute_cache_on_object_event() {
+  // Increment epoch and recompute only every 256 object in/out events.
+  const auto epoch = _object_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+  if ((epoch & RECOMPUTE_MASK) == 0) {
+    _recompute_cache_now();
+  }
+}
+
+void BufferPool::_recompute_cache_now() {
+  // We approximate average object size by used_bytes / resident_objects.
+  // Then cache_size_objects ≈ max_bytes / avg_object_bytes.
+  // If resident_objects == 0, fall back to min-page size capacity.
+  const auto objs = resident_objects.load(std::memory_order_relaxed);
+
+  const auto min_page_bytes = bytes_for_size_type(MIN_PAGE_SIZE_TYPE);
+  const uint64_t safe_min_page = (min_page_bytes ? min_page_bytes : 1u);
+
+  uint64_t avg_object_bytes = safe_min_page;
+
+  if (objs > 0) {
+    const auto bytes = used_bytes.load(std::memory_order_relaxed);
+
+    // If bytes is 0 (possible in tests / early init), fall back safely.
+    if (bytes > 0) {
+      avg_object_bytes = bytes / objs;
+      if (avg_object_bytes == 0) {
+        avg_object_bytes = 1;
+      }
+    }
+  }
+
+  uint64_t capacity_objects = max_bytes / (avg_object_bytes ? avg_object_bytes : 1u);
+
+  // Keep it non-zero
+  if (capacity_objects == 0) {
+    capacity_objects = 1;
+  }
+
+  if (capacity_objects > std::numeric_limits<uint32_t>::max()) {
+    capacity_objects = std::numeric_limits<uint32_t>::max();
+  }
+
+  _cached_cache_size_objects.store(static_cast<uint32_t>(capacity_objects), std::memory_order_relaxed);
+}
+
+uint32_t BufferPool::cached_cache_size_objects() const {
+  auto v = _cached_cache_size_objects.load(std::memory_order_relaxed);
+  if (v == 0) {
+    // Should not happen
+    const auto min_page_bytes = bytes_for_size_type(MIN_PAGE_SIZE_TYPE);
+    const auto slots = static_cast<uint64_t>(max_bytes / (min_page_bytes ? min_page_bytes : 1u));
+    v = static_cast<uint32_t>(std::min<uint64_t>(slots ? slots : 1u, std::numeric_limits<uint32_t>::max()));
+  }
+  return v;
+}
+
+void BufferPool::account_object_in() {
+  resident_objects.fetch_add(1, std::memory_order_relaxed);
+
+  if (metrics) {
+    const auto now = metrics->resident_objects.fetch_add(1, std::memory_order_relaxed) + 1;
+    // best-effort peak tracking
+    auto prev_peak = metrics->peak_resident_objects.load(std::memory_order_relaxed);
+    while (now > prev_peak &&
+           !metrics->peak_resident_objects.compare_exchange_weak(prev_peak, now, std::memory_order_relaxed)) {
+      // retry
+    }
+  }
+
+  _maybe_recompute_cache_on_object_event();
+}
+
+void BufferPool::account_object_out() {
+#ifndef NDEBUG
+  const auto before = resident_objects.load(std::memory_order_relaxed);
+  if (before == 0) {
+    std::ostringstream oss;
+    oss << "BufferPool::account_object_out underflow: resident_objects=0 node_id=" << node_id << " enabled=" << enabled;
+    Fail(oss.str());
+  }
 #endif
+
+  resident_objects.fetch_sub(1, std::memory_order_relaxed);
+
+  if (metrics) {
+#ifndef NDEBUG
+    const auto mbefore = metrics->resident_objects.load(std::memory_order_relaxed);
+    if (mbefore == 0) {
+      std::ostringstream oss;
+      oss << "BufferPoolMetrics::resident_objects underflow: node_id=" << node_id << " enabled=" << enabled;
+      Fail(oss.str());
+    }
+#endif
+    metrics->resident_objects.fetch_sub(1, std::memory_order_relaxed);
+  }
+
+  _maybe_recompute_cache_on_object_event();
+}
+
+uint64_t BufferPool::resident_object_count() const {
+  return resident_objects.load(std::memory_order_relaxed);
+}
 
 void BufferPool::add_eviction_candidate(const PageID page_id, Frame* frame) {
   eviction_strategy->add_eviction_candidate(page_id, frame);
+}
+
+void BufferPool::on_access(const PageID& page_id, Frame* frame) {
+  eviction_strategy->on_access(page_id, frame);
 }
 
 void BufferPool::purge_eviction_candidates() {
@@ -90,11 +178,12 @@ void BufferPool::free_bytes(const uint64_t bytes) {
     oss << "BufferPool::free_bytes underflow: before=" << before << " sub=" << bytes << " max_bytes=" << max_bytes
         << " node_id=" << node_id << " enabled=" << enabled;
 
-    // Best-effort backtrace
+#if HYRISE_HAS_EXECINFO
     std::vector<void*> addrs(64);
     const auto n = ::backtrace(addrs.data(), static_cast<int>(addrs.size()));
-    if (n > 0)
+    if (n > 0) {
       addrs.resize(static_cast<size_t>(n));
+    }
     char** syms = ::backtrace_symbols(addrs.data(), static_cast<int>(addrs.size()));
     if (syms) {
       oss << "\nBacktrace:";
@@ -103,6 +192,7 @@ void BufferPool::free_bytes(const uint64_t bytes) {
       }
       std::free(syms);
     }
+#endif
 
     Fail(oss.str());
   }
@@ -170,10 +260,14 @@ void BufferPool::evict(EvictionItem& item, Frame* frame) {
       // Otherwise we just write the page if its dirty and free the associated pages
       if (frame->is_dirty()) {
         auto data = region->get_page(item.page_id);
-        ssd_region->write_page(item.page_id, data);  // TODO: use global function
+        ssd_region->write_page(item.page_id, data);
         region->protect_page(item.page_id);
         frame->reset_dirty();
       }
+
+      // Resident -> evicted (SSD)
+      account_object_out();
+
       region->free(item.page_id);
       frame->unlock_exclusive_and_set_evicted();
 
@@ -185,14 +279,24 @@ void BufferPool::evict(EvictionItem& item, Frame* frame) {
       if (!target_buffer_pool->ensure_free_pages(item.page_id.size_type())) {
         yield(repeat);
         continue;
-      };
+      }
+
       region->mbind_to_numa_node(item.page_id, target_buffer_pool->node_id);
+
+      // Resident moves between pools: source out, target in.
+      account_object_out();
+      target_buffer_pool->account_object_in();
 
       frame->set_node_id(target_buffer_pool->node_id);
 
+      // Each pool has its own logical clock, but last_access_time is stored in
+      // the Frame. If we migrate a frame between pools, the delta computation
+      // in D-FR can see "time going backwards" and wrap, causing spurious
+      // reward. Reset the per-frame timestamp on migration.
+      frame->set_last_access_time(0);
+
       frame->unlock_exclusive();
       target_buffer_pool->add_eviction_candidate(item.page_id, frame);
-      //   TODO:increment_counter(metrics.total_bytes_copied_from_dram_to_numa, num_bytes);
       return;
     }
   }
@@ -200,8 +304,6 @@ void BufferPool::evict(EvictionItem& item, Frame* frame) {
 }
 
 size_t BufferPool::memory_consumption() const {
-  // TODO:: does adding the eviction strategy's consumption make sense here? Aligning to the old implementation, I think
-  // so.
   return sizeof(*this) + eviction_strategy->memory_consumption();
 }
 
@@ -216,7 +318,7 @@ size_t BufferPool::free_bytes_node() const {
 #else
   return 0;
 #endif
-};
+}
 
 size_t BufferPool::total_bytes_node() const {
 #if HYRISE_NUMA_SUPPORT
@@ -227,5 +329,6 @@ size_t BufferPool::total_bytes_node() const {
 #else
   return 0;
 #endif
-};
+}
+
 }  // namespace hyrise

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <memory>
+
 #include <storage/buffer/eviction_strategy.hpp>
 #include "storage/buffer/helper.hpp"
 #include "storage/buffer/migration_policy.hpp"
@@ -31,6 +34,8 @@ struct BufferPool {
 
   void add_eviction_candidate(const PageID page_id, Frame* frame);
 
+  void on_access(const PageID& page_id, Frame* frame);
+
   void purge_eviction_candidates();
 
   size_t free_bytes_node() const;
@@ -39,11 +44,24 @@ struct BufferPool {
 
   size_t memory_consumption() const;
 
+  // Each resident PageID counts as one object.
+  void account_object_in();
+  void account_object_out();
+
+  uint64_t resident_object_count() const;
+
+  // cached approximation of "cache_size in objects".
+  // Updated every 256 object in/out operations
+  uint32_t cached_cache_size_objects() const;
+
   // The maximum number of bytes that can be allocated
   const uint64_t max_bytes;
 
-  // The number of bytes that are currently used
+  // The number of bytes that are currently used (budget/reservation based)
   std::atomic_uint64_t used_bytes;
+
+  // Number of resident objects in this pool.
+  std::atomic_uint64_t resident_objects{0};
 
   std::shared_ptr<BufferPoolMetrics> metrics;
 
@@ -63,5 +81,20 @@ struct BufferPool {
   const NodeID node_id;
 
   const bool enabled;
+
+ private:
+  // Recompute cached cache-size approximation occasionally.
+  void _maybe_recompute_cache_on_object_event();
+  void _recompute_cache_now();
+
+  // Update period: 256 object events
+  static constexpr uint32_t RECOMPUTE_MASK = 0xFF;  // every 256
+
+  // Counts object in/out events.
+  std::atomic_uint32_t _object_epoch{0};
+
+  // Cached approximation of "cache_size in objects".
+  std::atomic_uint32_t _cached_cache_size_objects{0};
 };
+
 }  // namespace hyrise

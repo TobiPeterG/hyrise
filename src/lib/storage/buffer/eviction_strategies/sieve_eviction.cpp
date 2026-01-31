@@ -186,6 +186,12 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
   return true;
 }
 
+void SieveEviction::on_access(const PageID& /*page_id*/, Frame* const frame) {
+  // visited/reference bit that is cleared upon scan.
+  // On access, we set it.
+  frame->set_reference_level(1);
+}
+
 void SieveEviction::add_eviction_candidate(const PageID& page_id, Frame* const frame) {
   const auto current_state_and_version = frame->state_and_version();
   DebugAssert(frame->node_id() == _buffer_pool.node_id, "Memory node mismatch");

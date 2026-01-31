@@ -1,14 +1,21 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 
 namespace hyrise {
 
 struct BufferPoolMetrics {
   std::atomic_uint64_t num_eviction_queue_items_purged = 0;
   std::atomic_uint64_t num_eviction_queue_adds = 0;
-  std::atomic_uint64_t num_evictions;
+  std::atomic_uint64_t num_evictions = 0;
   std::atomic_uint64_t total_bytes_copied_to_ssd = 0;
+
+  // Number of resident objects (pages) currently in this pool.
+  std::atomic_uint64_t resident_objects = 0;
+
+  // peak resident objects observed
+  std::atomic_uint64_t peak_resident_objects = 0;
 };
 
 // TODO: Add
@@ -18,7 +25,7 @@ struct BufferManagerMetrics {
   //       0;  // TODO: Add Different one to signify max usage in pool vs allo/delloc
   //   std::atomic_uint64_t current_bytes_used_numa = 0;
 
-  std::atomic_uint64_t total_allocated_bytes;
+  std::atomic_uint64_t total_allocated_bytes = 0;
   std::atomic_uint64_t total_unused_bytes = 0;  // TODO: this becomes invalid with the monotonic buffer resource
 
   double internal_fragmentation_rate() const {
@@ -67,4 +74,9 @@ struct BufferManagerMetrics {
 inline void increment_counter(std::atomic_uint64_t& metric, const size_t update = 1) {
   metric.fetch_add(update, std::memory_order_relaxed);
 }
+
+inline void decrement_counter(std::atomic_uint64_t& metric, const size_t update = 1) {
+  metric.fetch_sub(update, std::memory_order_relaxed);
+}
+
 }  // namespace hyrise

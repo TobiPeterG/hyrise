@@ -1,13 +1,14 @@
 #include <bitset>
 #include <iostream>
 
-#include "storage/buffer/helper.hpp"
 #include "storage/buffer/frame.hpp"
+#include "storage/buffer/helper.hpp"
 
 namespace hyrise {
 
 Frame::Frame() {
   _state_and_version.store(update_state_with_same_version(0, EVICTED), std::memory_order_release);
+  _last_access_time.store(0, std::memory_order_relaxed);
 }
 
 void Frame::set_node_id(const NodeID node_id) {
@@ -48,19 +49,39 @@ bool Frame::is_dirty() const {
 }
 
 uint8_t Frame::reference_level() const {
-  const auto sav = _state_and_version.load(std::memory_order_relaxed);
-  return static_cast<uint8_t>((sav & REF_MASK) >> REF_SHIFT);
+  return reference_level(_state_and_version.load(std::memory_order_relaxed));
+}
+
+uint8_t Frame::reference_level(StateVersionType state_and_version) {
+  return static_cast<uint8_t>((state_and_version & REF_MASK) >> REF_SHIFT);
 }
 
 bool Frame::is_referenced(StateVersionType state_and_version) {
-  return ((state_and_version & REF_MASK) >> REF_SHIFT) != 0;
+  return reference_level(state_and_version) != 0;
 }
 
-void Frame::mark_referenced() {
+void Frame::set_reference_level(uint8_t level) {
+  if (level > 3) {
+    level = 3;
+  }
   auto old = _state_and_version.load(std::memory_order_relaxed);
   while (true) {
-    const auto ref = static_cast<uint8_t>((old & REF_MASK) >> REF_SHIFT);
-    const auto new_ref = static_cast<uint8_t>(ref < 3 ? (ref + 1) : 3);
+    const auto cleared = old & ~REF_MASK;
+    const auto desired = cleared | (static_cast<uint64_t>(level) << REF_SHIFT);
+    if (_state_and_version.compare_exchange_weak(old, desired, std::memory_order_relaxed)) {
+      return;
+    }
+  }
+}
+
+void Frame::inc_reference_level_saturating(uint8_t max_level) {
+  if (max_level > 3) {
+    max_level = 3;
+  }
+  auto old = _state_and_version.load(std::memory_order_relaxed);
+  while (true) {
+    const auto ref = reference_level(old);
+    const auto new_ref = static_cast<uint8_t>(ref < max_level ? (ref + 1) : max_level);
     const auto cleared = old & ~REF_MASK;
     const auto desired = cleared | (static_cast<uint64_t>(new_ref) << REF_SHIFT);
     if (_state_and_version.compare_exchange_weak(old, desired, std::memory_order_relaxed)) {
@@ -69,11 +90,13 @@ void Frame::mark_referenced() {
   }
 }
 
-void Frame::set_reference_max() {
+void Frame::dec_reference_level_if_positive() {
   auto old = _state_and_version.load(std::memory_order_relaxed);
   while (true) {
+    const auto ref = reference_level(old);
+    const auto new_ref = static_cast<uint8_t>(ref > 0 ? (ref - 1) : 0);
     const auto cleared = old & ~REF_MASK;
-    const auto desired = cleared | (static_cast<uint64_t>(3) << REF_SHIFT);
+    const auto desired = cleared | (static_cast<uint64_t>(new_ref) << REF_SHIFT);
     if (_state_and_version.compare_exchange_weak(old, desired, std::memory_order_relaxed)) {
       return;
     }
@@ -82,6 +105,14 @@ void Frame::set_reference_max() {
 
 void Frame::clear_reference() {
   _state_and_version.fetch_and(~REF_MASK, std::memory_order_relaxed);
+}
+
+uint32_t Frame::last_access_time() const {
+  return _last_access_time.load(std::memory_order_relaxed);
+}
+
+void Frame::set_last_access_time(uint32_t t) {
+  _last_access_time.store(t, std::memory_order_relaxed);
 }
 
 void Frame::unlock_exclusive_and_set_evicted() {

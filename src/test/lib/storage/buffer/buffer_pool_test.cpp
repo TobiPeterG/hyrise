@@ -145,12 +145,14 @@ TEST_P(BufferPoolTest, TestAddToEvictionQueueIncrementsMetric) {
   ASSERT_NE(frame, nullptr);
   ASSERT_NE(ptr, nullptr);
 
-  // To satisfy add_eviction_candidate's DebugAssert(frame->node_id() == node_id),
-  // we need to set the frame's node_id while exclusively locked.
-  auto state_and_version = frame->state_and_version();
-  ASSERT_TRUE(frame->try_lock_exclusive(state_and_version));
-  frame->set_node_id(pool.node_id);
-  frame->unlock_exclusive();
+  // Put page "into the pool": set node_id and account it as resident.
+  {
+    auto state_and_version = frame->state_and_version();
+    ASSERT_TRUE(frame->try_lock_exclusive(state_and_version));
+    frame->set_node_id(pool.node_id);
+    frame->unlock_exclusive();
+  }
+  pool.account_object_in();
 
   const auto before_adds = pool.metrics->num_eviction_queue_adds.load(std::memory_order_relaxed);
   pool.add_eviction_candidate(page_id, frame);
@@ -158,6 +160,7 @@ TEST_P(BufferPoolTest, TestAddToEvictionQueueIncrementsMetric) {
   EXPECT_EQ(after_adds, before_adds + 1);
 
   // Cleanup
+  pool.account_object_out();
   region->deallocate(page_id);
 }
 
@@ -228,14 +231,16 @@ TEST_P(BufferPoolTest, TestEnsureFreePagesEvictsUnreferencedPageToSSDAndFreesBud
   ASSERT_NE(frame, nullptr);
   ASSERT_NE(ptr, nullptr);
 
+  // Put the page into the pool and mark it dirty.
   {
     auto state_and_version = frame->state_and_version();
     ASSERT_TRUE(frame->try_lock_exclusive(state_and_version));
     frame->set_node_id(pool.node_id);
     frame->set_dirty(true);
     touch_page(ptr);
-    frame->unlock_exclusive();  // increments version and leaves UNLOCKED
+    frame->unlock_exclusive();
   }
+  pool.account_object_in();
 
   // Make sure the victim is not referenced, so we will allow eviction.
   frame->clear_reference();
@@ -266,6 +271,7 @@ TEST_P(BufferPoolTest, TestEnsureFreePagesEvictsUnreferencedPageToSSDAndFreesBud
   EXPECT_EQ(pool.used_bytes.load(std::memory_order_relaxed), pool_size);
 
   // Cleanup
+  // Page was evicted -> eviction already accounted object_out, so do not account out here.
   region->deallocate(page_id);
 }
 
@@ -291,13 +297,14 @@ TEST_P(BufferPoolTest, TestPurgeEvictionQueueKeepsEvictableOrMarkableItems) {
   ASSERT_NE(frame, nullptr);
   ASSERT_NE(ptr, nullptr);
 
-  // Put it on correct node, leave UNLOCKED
+  // Put it on correct node, leave UNLOCKED, and account it as resident.
   {
     auto state_and_version = frame->state_and_version();
     ASSERT_TRUE(frame->try_lock_exclusive(state_and_version));
     frame->set_node_id(pool.node_id);
     frame->unlock_exclusive();
   }
+  pool.account_object_in();
 
   // Push item with matching timestamp
   pool.add_eviction_candidate(page_id, frame);
@@ -309,9 +316,12 @@ TEST_P(BufferPoolTest, TestPurgeEvictionQueueKeepsEvictableOrMarkableItems) {
   pool.used_bytes.store(pool.max_bytes, std::memory_order_relaxed);
 
   // This should not immediately fail due to empty queue.
-  // It might still return false if the item gets purged for other reasons
   (void)pool.ensure_free_pages(PageSizeType::KiB4);
 
+  // Cleanup
+  if (Frame::state(frame->state_and_version()) != Frame::EVICTED) {
+    pool.account_object_out();
+  }
   region->deallocate(page_id);
 }
 

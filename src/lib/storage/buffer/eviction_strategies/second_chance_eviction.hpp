@@ -9,6 +9,7 @@ public:
   explicit SecondChanceEviction(BufferPool& buffer_pool);
   bool perform_evictions(PageSizeType required_size) override;
   void add_eviction_candidate(const PageID& page_id, Frame* frame) override;
+  void on_access(const PageID& page_id, Frame* frame) override;  // NEW
   std::size_t memory_consumption() const override;
   void purge_eviction_candidates() override;
 

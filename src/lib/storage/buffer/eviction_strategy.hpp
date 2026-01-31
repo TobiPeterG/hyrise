@@ -12,6 +12,7 @@ class EvictionStrategy {
   virtual bool perform_evictions(PageSizeType required_size) = 0;
   virtual void add_eviction_candidate(const PageID& page_id, Frame* frame) = 0;
   virtual void purge_eviction_candidates() = 0;
+  virtual void on_access(const PageID&, Frame* /*frame*/) {}
   virtual std::size_t memory_consumption() const = 0;
 
  protected:

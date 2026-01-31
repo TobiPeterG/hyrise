@@ -321,49 +321,12 @@ void BufferManager::_dump_tracked_allocations() const {
 }
 #endif
 
-#ifndef NDEBUG
-static std::string _prot_of_addr(void* addr) {
-  std::ifstream maps("/proc/self/maps");
-  std::string line;
-  auto a = reinterpret_cast<uintptr_t>(addr);
-
-  while (std::getline(maps, line)) {
-    // format: start-end perms offset dev inode pathname
-    std::istringstream iss(line);
-    std::string range, perms;
-    if (!(iss >> range >> perms))
-      continue;
-
-    auto dash = range.find('-');
-    if (dash == std::string::npos)
-      continue;
-
-    auto start = std::stoull(range.substr(0, dash), nullptr, 16);
-    auto end = std::stoull(range.substr(dash + 1), nullptr, 16);
-
-    if (a >= start && a < end)
-      return perms;  // e.g. "rw-p" or "---p"
-  }
-  return "<not-mapped>";
-}
-#endif
-
-#ifndef NDEBUG
-std::string BufferManager::debug_perms(void* addr) const {
-  return _prot_of_addr(addr);
-}
-#endif
-
 // TODO: This can take several templates to improve branching
 void BufferManager::make_resident(const PageID page_id, const AccessIntent access_intent,
                                   const Frame::StateVersionType state_before_exclusive) {
-  // TODO: retake the desiscion here if something
-  // TODO: What happens for the allocate case? Inpret allocate as a write regarding mig policy -> new method for pin
-  // Check if the page was freshly allocated by checking the version. In this case, we want to use either DRAM or NUMA
-  const auto version = Frame::version(state_before_exclusive);
   const auto is_evicted = Frame::state(state_before_exclusive) == Frame::EVICTED;
 
-  // Case 1: The page is already on DRAM. This is the easy case.
+  // Case 1: The page is already on DRAM.
   if (!is_evicted && Frame::node_id(state_before_exclusive) == _primary_buffer_pool->node_id) {
     _metrics->total_hits.fetch_add(1, std::memory_order_relaxed);
     return;
@@ -373,7 +336,7 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
   auto frame = region->get_frame(page_id);  // Required for updating node placement consistently
 
   if (!_secondary_buffer_pool->enabled) {
-    // Case 3: The page is not on DRAM and we don't have it on another memory node, so we need to load it from SSD
+    // Case 3: Not on DRAM and no other memory node -> load from SSD to DRAM
     region->unprotect_page(page_id);
     DebugAssert(Frame::node_id(state_before_exclusive) == _primary_buffer_pool->node_id, "Not on DRAM node");
     for (auto repeat = size_t{0}; repeat < MAX_REPEAT_COUNT; ++repeat) {
@@ -383,20 +346,23 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
       }
       _ssd_region->read_page(page_id, region->get_page(page_id));
 
-      // Required: page is now resident on DRAM
+      // Page becomes resident in DRAM pool now
       frame->set_node_id(_primary_buffer_pool->node_id);
+      _primary_buffer_pool->account_object_in();
 
       add_to_eviction_queue(page_id, frame);
+
+      // Load counts as access
+      _primary_buffer_pool->on_access(page_id, frame);
 
       increment_counter(_metrics->total_misses);
       increment_counter(_metrics->total_bytes_copied_from_ssd_to_dram, page_id.num_bytes());
       return;
     }
-    Fail(
-        "Could not allocate page on DRAM. Try increasing the buffer pool size.");  // TODO: missing quite some item in queue
+    Fail("Could not allocate page on DRAM. Try increasing the buffer pool size.");
   }
 
-  // Case 4: The page is evicted anyways, decide if numa should be bypassed or not and load the page
+  // Case 4: Page is evicted -> load into DRAM or NUMA
   if (is_evicted) {
     region->unprotect_page(page_id);
 
@@ -405,8 +371,9 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
           !_secondary_buffer_pool->enabled ||
           (access_intent == AccessIntent::Read && _config.migration_policy.bypass_numa_during_read()) ||
           (access_intent == AccessIntent::Write && _config.migration_policy.bypass_numa_during_write());
+
       if (bypass_numa) {
-        // Case 4.1: We bypass NUMA and load directly into DRAM
+        // 4.1: SSD -> DRAM
         if (!_primary_buffer_pool->ensure_free_pages(page_id.size_type())) {
           yield(repeat);
           continue;
@@ -417,14 +384,17 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
           region->mbind_to_numa_node(page_id, _primary_buffer_pool->node_id);
         }
 
-        // Required
         frame->set_node_id(_primary_buffer_pool->node_id);
+        _primary_buffer_pool->account_object_in();
 
         add_to_eviction_queue(page_id, frame);
 
+        // Load counts as access
+        _primary_buffer_pool->on_access(page_id, frame);
+
         increment_counter(_metrics->total_bytes_copied_from_ssd_to_dram, page_id.num_bytes());
       } else {
-        // Case 4.2: We bypass load the page into NUMA
+        // 4.2: SSD -> NUMA
         if (!_secondary_buffer_pool->ensure_free_pages(page_id.size_type())) {
           yield(repeat);
           continue;
@@ -435,13 +405,17 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
           region->mbind_to_numa_node(page_id, _secondary_buffer_pool->node_id);
         }
 
-        // Required
         frame->set_node_id(_secondary_buffer_pool->node_id);
+        _secondary_buffer_pool->account_object_in();
 
         add_to_eviction_queue(page_id, frame);
 
+        // Load counts as access
+        _secondary_buffer_pool->on_access(page_id, frame);
+
         increment_counter(_metrics->total_bytes_copied_from_ssd_to_numa, page_id.num_bytes());
       }
+
       _ssd_region->read_page(page_id, region->get_page(page_id));
       increment_counter(_metrics->total_misses);
       return;
@@ -449,7 +423,7 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
     Fail("Could not allocate page on DRAM or NUMA for an evicted page. Try increasing the buffer pool sizes.");
   }
 
-  // Case 5: thepage should be one numa, check if we want to bypass
+  // Case 5: Page is on NUMA, maybe migrate to DRAM
   DebugAssert(Frame::node_id(state_before_exclusive) == _secondary_buffer_pool->node_id, "Should be on NUMA");
   for (auto repeat = size_t{0}; repeat < MAX_REPEAT_COUNT; ++repeat) {
     const auto bypass_dram =
@@ -457,31 +431,39 @@ void BufferManager::make_resident(const PageID page_id, const AccessIntent acces
         (access_intent == AccessIntent::Write && _config.migration_policy.bypass_dram_during_write());
 
     if (bypass_dram) {
-      // Case 5.1: Do nothing, stay on NUMA
+      // 5.1: Stay on NUMA
       increment_counter(_metrics->total_hits);
-      return;
-    } else {
-      // Case 5.2: Migrate to DRAM
-      if (!_primary_buffer_pool->ensure_free_pages(page_id.size_type())) {
-        yield(repeat);
-        continue;
-      }
-      _secondary_buffer_pool->free_bytes(bytes_for_size_type(page_id.size_type()));
-
-      // Only perform NUMA syscalls when NUMA is enabled at runtime.
-      if (_secondary_buffer_pool->enabled) {
-        region->mbind_to_numa_node(page_id, _primary_buffer_pool->node_id);
-      }
-
-      // Required: page is now on DRAM (prevents wrong refunds / double refunds later)
-      frame->set_node_id(_primary_buffer_pool->node_id);
-
-      add_to_eviction_queue(page_id, frame);
-
-      increment_counter(_metrics->total_hits);
-      increment_counter(_metrics->total_bytes_copied_from_numa_to_dram, page_id.num_bytes());
       return;
     }
+
+    // 5.2: Migrate NUMA -> DRAM
+    if (!_primary_buffer_pool->ensure_free_pages(page_id.size_type())) {
+      yield(repeat);
+      continue;
+    }
+
+    // Byte accounting already existed:
+    _secondary_buffer_pool->free_bytes(bytes_for_size_type(page_id.size_type()));
+
+    // Object accounting: NUMA loses one, DRAM gains one
+    _secondary_buffer_pool->account_object_out();
+    _primary_buffer_pool->account_object_in();
+
+    // Only perform NUMA syscalls when NUMA is enabled at runtime.
+    if (_secondary_buffer_pool->enabled) {
+      region->mbind_to_numa_node(page_id, _primary_buffer_pool->node_id);
+    }
+
+    frame->set_node_id(_primary_buffer_pool->node_id);
+
+    add_to_eviction_queue(page_id, frame);
+
+    // Notify strategy
+    _primary_buffer_pool->on_access(page_id, frame);
+
+    increment_counter(_metrics->total_hits);
+    increment_counter(_metrics->total_bytes_copied_from_numa_to_dram, page_id.num_bytes());
+    return;
   }
   Fail("Could not allocate page on DRAM. Try increasing the buffer pool size.");
 }
@@ -493,7 +475,6 @@ void BufferManager::pin_shared(const PageID page_id, const AccessIntent accessIn
   increment_counter(_metrics->current_pins);
 
   const auto frame = get_region(page_id)->get_frame(page_id);
-  // TODO: Another, make_resident?
   for (auto repeat = size_t{0};; ++repeat) {
     auto state_and_version = frame->state_and_version();
 
@@ -501,7 +482,6 @@ void BufferManager::pin_shared(const PageID page_id, const AccessIntent accessIn
       case Frame::LOCKED: {
         break;
       }
-      // case Frame::MARKED: TODO
       case Frame::EVICTED: {
         if (frame->try_lock_exclusive(state_and_version)) {
           make_resident(page_id, accessIntent, state_and_version);
@@ -511,7 +491,14 @@ void BufferManager::pin_shared(const PageID page_id, const AccessIntent accessIn
       }
       default: {
         if (frame->try_lock_shared(state_and_version)) {
-          frame->mark_referenced();
+          if (frame->node_id() == _primary_buffer_pool->node_id) {
+            _primary_buffer_pool->on_access(page_id, frame);
+          } else if (frame->node_id() == _secondary_buffer_pool->node_id) {
+            DebugAssert(_secondary_buffer_pool->enabled, "Pool has to be enabled");
+            _secondary_buffer_pool->on_access(page_id, frame);
+          } else {
+            Fail("Cannot find buffer pool for given memory node " + std::to_string(frame->node_id()));
+          }
           return;
         }
         break;
@@ -529,14 +516,22 @@ void BufferManager::pin_exclusive(const PageID page_id) {
   increment_counter(_metrics->current_pins);
 
   const auto frame = get_region(page_id)->get_frame(page_id);
-  // TODO: Use another make_resident?
   for (auto repeat = size_t{0};; ++repeat) {
     auto state_and_version = frame->state_and_version();
     switch (Frame::state(state_and_version)) {
       case Frame::EVICTED: {
         if (frame->try_lock_exclusive(state_and_version)) {
           make_resident(page_id, AccessIntent::Write, state_and_version);
-          frame->mark_referenced();
+
+          if (frame->node_id() == _primary_buffer_pool->node_id) {
+            _primary_buffer_pool->on_access(page_id, frame);
+          } else if (frame->node_id() == _secondary_buffer_pool->node_id) {
+            DebugAssert(_secondary_buffer_pool->enabled, "Pool has to be enabled");
+            _secondary_buffer_pool->on_access(page_id, frame);
+          } else {
+            Fail("Cannot find buffer pool for given memory node " + std::to_string(frame->node_id()));
+          }
+
           return;
         }
         break;
@@ -544,11 +539,22 @@ void BufferManager::pin_exclusive(const PageID page_id) {
       case Frame::UNLOCKED: {
         if (frame->try_lock_exclusive(state_and_version)) {
           make_resident(page_id, AccessIntent::Write, state_and_version);
-          frame->mark_referenced();
+
+          if (frame->node_id() == _primary_buffer_pool->node_id) {
+            _primary_buffer_pool->on_access(page_id, frame);
+          } else if (frame->node_id() == _secondary_buffer_pool->node_id) {
+            DebugAssert(_secondary_buffer_pool->enabled, "Pool has to be enabled");
+            _secondary_buffer_pool->on_access(page_id, frame);
+          } else {
+            Fail("Cannot find buffer pool for given memory node " + std::to_string(frame->node_id()));
+          }
+
           return;
         }
         break;
       }
+      default:
+        break;
     }
     yield(repeat);
   }
@@ -573,33 +579,32 @@ void BufferManager::unpin_exclusive(const PageID page_id) {
 
 void BufferManager::set_dirty(const PageID page_id) {
   DebugAssert(page_id.valid(), "Invalid page id");
-
   get_region(page_id)->get_frame(page_id)->set_dirty(true);
 }
 
 size_t BufferManager::reserved_bytes_dram_buffer_pool() const {
   return _primary_buffer_pool->used_bytes.load(std::memory_order_relaxed);
-};
+}
 
 size_t BufferManager::reserved_bytes_numa_buffer_pool() const {
   return _secondary_buffer_pool->used_bytes.load(std::memory_order_relaxed);
-};
+}
 
 size_t BufferManager::free_bytes_dram_node() const {
   return _primary_buffer_pool->free_bytes_node();
-};
+}
 
 size_t BufferManager::free_bytes_numa_node() const {
   return _secondary_buffer_pool->free_bytes_node();
-};
+}
 
 size_t BufferManager::total_bytes_dram_node() const {
   return _primary_buffer_pool->total_bytes_node();
-};
+}
 
 size_t BufferManager::total_bytes_numa_node() const {
   return _secondary_buffer_pool->total_bytes_node();
-};
+}
 
 BufferManager::Config BufferManager::config() const {
   return _config;
@@ -683,8 +688,6 @@ void* BufferManager::do_allocate(std::size_t bytes, std::size_t alignment) {
 
   region->unprotect_page(page_id);
 
-  // Use either NUMA or DRAM for allocation
-  // TODO: Which one?
   auto buffer_pool =
       (_secondary_buffer_pool && _secondary_buffer_pool->enabled && _config.migration_policy.bypass_dram_during_write())
           ? _secondary_buffer_pool
@@ -701,11 +704,15 @@ void* BufferManager::do_allocate(std::size_t bytes, std::size_t alignment) {
       region->mbind_to_numa_node(page_id, buffer_pool->node_id);
     }
 
-    // Required: make accounting and deallocation consistent
     frame->set_node_id(buffer_pool->node_id);
 
+    // Newly allocated page becomes resident in chosen pool
+    buffer_pool->account_object_in();
+
     buffer_pool->add_eviction_candidate(page_id, frame);
-    frame->set_reference_max();
+
+    // Allocation counts as access
+    buffer_pool->on_access(page_id, frame);
 
 #ifndef NDEBUG
     bool in_extent_hooks_inner = false;
@@ -792,13 +799,20 @@ void BufferManager::do_deallocate(void* p, std::size_t bytes, std::size_t alignm
                                       " but page size=" + std::to_string(num_bytes) +
                                       " size_type=" + std::string(magic_enum::enum_name(page_id.size_type())));
 
-  if (frame->node_id() == _primary_buffer_pool->node_id) {
-    _primary_buffer_pool->free_bytes(num_bytes);
-  } else if (_secondary_buffer_pool && _secondary_buffer_pool->enabled &&
-             frame->node_id() == _secondary_buffer_pool->node_id) {
-    _secondary_buffer_pool->free_bytes(num_bytes);
-  } else {
-    Fail("Cannot find buffer pool for given memory node " + std::to_string(frame->node_id()));
+  // Use the state before we acquired exclusive lock to decide if it was resident.
+  const auto was_evicted = Frame::state(state_and_version) == Frame::EVICTED;
+
+  if (!was_evicted) {
+    if (frame->node_id() == _primary_buffer_pool->node_id) {
+      _primary_buffer_pool->account_object_out();
+      _primary_buffer_pool->free_bytes(num_bytes);
+    } else if (_secondary_buffer_pool && _secondary_buffer_pool->enabled &&
+               frame->node_id() == _secondary_buffer_pool->node_id) {
+      _secondary_buffer_pool->account_object_out();
+      _secondary_buffer_pool->free_bytes(num_bytes);
+    } else {
+      Fail("Cannot find buffer pool for given memory node " + std::to_string(frame->node_id()));
+    }
   }
 
   region->free(page_id);
