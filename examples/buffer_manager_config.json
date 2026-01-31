@@ -12,6 +12,8 @@
 
   "enable_eviction_purge_worker": false,
   "enable_numa": false,
+  
+  "eviction_strategy": "second_chance",
 
   "cpu_node": 0,
   "memory_node": 0
