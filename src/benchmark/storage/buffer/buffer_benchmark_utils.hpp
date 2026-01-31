@@ -7,15 +7,24 @@
 #ifdef __linux__
 #include <x86intrin.h>
 #endif
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <numeric>
 #include <random>
+#include <string_view>
 #include <vector>
+
+#include <magic_enum.hpp>
+
 #include "benchmark/benchmark.h"
 #include "hdr/hdr_histogram.h"
 #include "hyrise.hpp"
@@ -28,6 +37,7 @@ namespace hyrise {
 constexpr static auto GB = 1024 * 1024 * 1024;
 constexpr static auto SEED = 123761253768512;
 constexpr static auto CACHE_LINE_SIZE = 64;
+
 static const char FAKE_DATA[512] __attribute__((aligned(512))) =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -54,18 +64,15 @@ inline std::byte* mmap_region(const size_t num_bytes) {
   const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
 #endif
   const auto mapped_memory = static_cast<std::byte*>(mmap(NULL, num_bytes, PROT_READ | PROT_WRITE, flags, -1, 0));
-
   if (mapped_memory == MAP_FAILED) {
     const auto error = errno;
-    Fail("Failed to map volatile pool region: " + strerror(error));
+    Fail("Failed to map volatile pool region: " + std::string(strerror(error)));
   }
-
   return mapped_memory;
 }
 
 inline int get_numa_node(void* addr) {
   int numa_node = -1;
-
 #if HYRISE_NUMA_SUPPORT
   if (get_mempolicy(&numa_node, NULL, 0, addr, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
     Fail("Failed to get numa node");
@@ -77,7 +84,7 @@ inline int get_numa_node(void* addr) {
 inline void munmap_region(std::byte* region, const size_t num_bytes) {
   if (munmap(region, num_bytes) < 0) {
     const auto error = errno;
-    Fail("Failed to unmap volatile pool region: " + strerror(error));
+    Fail("Failed to unmap volatile pool region: " + std::string(strerror(error)));
   }
 }
 
@@ -88,7 +95,6 @@ inline void explicit_move_pages(void* mem, size_t size, int node) {
   if (mbind(mem, size, MPOL_BIND, nodes ? nodes->maskp : NULL, nodes ? nodes->size + 1 : 0,
             MPOL_MF_MOVE | MPOL_MF_STRICT) != 0) {
     numa_bitmask_free(nodes);
-
     Fail("Move pages failed");
   }
   numa_bitmask_free(nodes);
@@ -158,7 +164,6 @@ inline void flush_cacheline(std::byte* ptr) {
 
 inline void flush_pipeline() {
   for (int i = 0; i < 100; i++) {
-    // __nop();
     asm("nop");
   }
 }
@@ -185,6 +190,7 @@ enum class YCSBWorkload {
   ReadMostly,   // Workload B, 95% Point Lookups
   Scan          // Workload E, Short Ranges, 95% Scans
 };
+
 enum class YSCBOperationType : int { Scan, Lookup, Update };
 
 enum class YCSBTupleSize : uint32_t {
@@ -205,60 +211,96 @@ using YCSBTable = std::vector<YCSBTuple>;
 using YSCBOperation = std::pair<YCSBKey, YSCBOperationType>;
 using YCSBOperations = std::vector<YSCBOperation>;
 
+// Deterministic seed helpers
+
+inline uint64_t mix64(uint64_t x) {
+  // SplitMix64 mix
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  x = x ^ (x >> 31);
+  return x;
+}
+
+// Deterministic table generation
+
 inline YCSBTable generate_ycsb_table(boost::container::pmr::memory_resource* memory_resource,
-                                     const size_t database_size) {
+                                     const size_t database_size, const uint64_t seed = 0) {
   Assert(database_size >= 1 * GB, "Database size must be greater than 1 GB");
-  std::mt19937 generator{std::random_device{}()};
-  std::uniform_int_distribution<int> distribution(0, magic_enum::enum_count<YCSBTupleSize>() - 1);
-  auto table = std::vector<YCSBTuple>{};
+
+  // Deterministic seed: based on global SEED + database_size unless caller provides one
+  const uint64_t effective_seed = (seed != 0) ? seed : mix64(SEED ^ static_cast<uint64_t>(database_size));
+  std::mt19937_64 generator(effective_seed);
+
+  std::uniform_int_distribution<int> distribution(0, static_cast<int>(magic_enum::enum_count<YCSBTupleSize>()) - 1);
+
+  YCSBTable table;
+  table.reserve(static_cast<size_t>(database_size / 4096));  // rough estimate
+
   size_t current_size = 0;
   auto& buffer_manager = Hyrise::get().buffer_manager;
+
   while (true) {
-    auto tuple_size = magic_enum::enum_value<YCSBTupleSize>(distribution(generator));
-    auto page_size = bytes_for_size_type(find_fitting_page_size_type(static_cast<size_t>(tuple_size)));
-    if (current_size + page_size > database_size) {
+    const auto tuple_size = magic_enum::enum_value<YCSBTupleSize>(distribution(generator));
+    const auto page_size = bytes_for_size_type(find_fitting_page_size_type(static_cast<size_t>(tuple_size)));
+
+    if (current_size + page_size > database_size)
       break;
-    }
+
     auto ptr = memory_resource->allocate(static_cast<size_t>(tuple_size), CACHE_LINE_SIZE);
     Assert(ptr != nullptr, "Allocation failed");
-    auto page_id = buffer_manager.find_page(ptr);
-    // buffer_manager.pin_exclusive(page_id);
+
+    const auto page_id = buffer_manager.find_page(ptr);
+
     std::memset(ptr, 0x1, page_size);
     buffer_manager.set_dirty(page_id);
-    // buffer_manager.unpin_exclusive(page_id);
+
     table.push_back({tuple_size, reinterpret_cast<std::byte*>(ptr)});
     current_size += page_size;
   }
 
-  DebugAssert(current_size <= database_size, "Table size is too small");
-  //
+  DebugAssert(current_size <= database_size, "Table size is too large");
   return table;
 }
 
+// Deterministic operation generation
+
 template <YCSBWorkload workload, size_t NumOperations>
-inline YCSBOperations generate_ycsb_operations(const size_t num_keys, const float zipf_skew) {
-  YCSBOperations ops;
-  static thread_local std::mt19937 generator{std::random_device{}()};
+inline YCSBOperations generate_ycsb_operations(const size_t num_keys, const float zipf_skew, const uint64_t seed = 0) {
+  Assert(num_keys > 0, "num_keys must be > 0");
+
+  // Deterministic seed: based on SEED + num_keys + workload unless caller provides one
+  const uint64_t effective_seed =
+      (seed != 0) ? seed : mix64(SEED ^ mix64(static_cast<uint64_t>(num_keys)) ^ static_cast<uint64_t>(workload));
+
+  std::mt19937_64 generator(effective_seed);
+
   std::uniform_int_distribution<int> op_distribution(0, 100);
   zipfian_int_distribution<size_t> key_distribution{0, num_keys - 1, zipf_skew};
+
   std::vector<YCSBKey> shuffled_keys(num_keys, 0);
   std::iota(shuffled_keys.begin(), shuffled_keys.end(), 0);
-  auto rng = std::default_random_engine{};
-  std::shuffle(std::begin(shuffled_keys), std::end(shuffled_keys), rng);
-  for (auto i = 0; i < NumOperations; i++) {
-    auto key_idx = key_distribution(generator);
-    auto key = shuffled_keys[key_idx];
+
+  // Deterministic shuffle RNG
+  std::mt19937_64 shuffle_rng(mix64(effective_seed ^ 0xA5A5A5A5A5A5A5A5ULL));
+  std::shuffle(shuffled_keys.begin(), shuffled_keys.end(), shuffle_rng);
+
+  YCSBOperations ops;
+  ops.reserve(NumOperations);
+
+  for (size_t i = 0; i < NumOperations; ++i) {
+    const auto key_idx = key_distribution(generator);
+    const auto key = shuffled_keys[key_idx];
+
     if constexpr (workload == YCSBWorkload::UpdateHeavy) {
-      auto op =
-          op_distribution(generator) < static_cast<int>(50) ? YSCBOperationType::Lookup : YSCBOperationType::Update;
-      ops.push_back(std::make_pair(key, op));
+      const auto op = op_distribution(generator) < 50 ? YSCBOperationType::Lookup : YSCBOperationType::Update;
+      ops.emplace_back(key, op);
     } else if constexpr (workload == YCSBWorkload::ReadMostly) {
-      auto op =
-          op_distribution(generator) < static_cast<int>(95) ? YSCBOperationType::Lookup : YSCBOperationType::Update;
-      ops.push_back(std::make_pair(key, op));
+      const auto op = op_distribution(generator) < 95 ? YSCBOperationType::Lookup : YSCBOperationType::Update;
+      ops.emplace_back(key, op);
     } else if constexpr (workload == YCSBWorkload::Scan) {
-      auto op = op_distribution(generator) < static_cast<int>(95) ? YSCBOperationType::Scan : YSCBOperationType::Update;
-      ops.push_back(std::make_pair(key, op));
+      const auto op = op_distribution(generator) < 95 ? YSCBOperationType::Scan : YSCBOperationType::Update;
+      ops.emplace_back(key, op);
     } else {
       Fail("Workload not supported");
     }
@@ -269,21 +311,27 @@ inline YCSBOperations generate_ycsb_operations(const size_t num_keys, const floa
 
 inline uint64_t execute_ycsb_action(const YCSBTable& table, BufferManager& buffer_manager,
                                     const YSCBOperation operation) {
+  // Thread-local RNG, deterministically seeded once per thread
+  static thread_local std::mt19937_64 rng(mix64(SEED ^ mix64(reinterpret_cast<uint64_t>(&rng))));
+
   const auto [key, op_type] = operation;
-  const auto [size_type, ptr] = table[key];
-  auto page_id = buffer_manager.find_page(ptr);
-  auto page_size_bytes = bytes_for_size_type(page_id.size_type());
-  auto num_cachelines = page_size_bytes / CACHE_LINE_SIZE;
+  const auto [tuple_size, ptr] = table[key];
+
+  const auto page_id = buffer_manager.find_page(ptr);
+  const auto page_size_bytes = bytes_for_size_type(page_id.size_type());
+  const auto num_cachelines = page_size_bytes / CACHE_LINE_SIZE;
+
+  std::uniform_int_distribution<size_t> dist(0, (num_cachelines > 0 ? num_cachelines - 1 : 0));
+  const auto offset = dist(rng) * CACHE_LINE_SIZE;
+
   switch (op_type) {
     case YSCBOperationType::Lookup: {
-      auto offset = (rand() % num_cachelines) * CACHE_LINE_SIZE;
       buffer_manager.pin_shared(page_id, AccessIntent::Read);
       simulate_cacheline_load(ptr + offset);
       buffer_manager.unpin_shared(page_id);
       return CACHE_LINE_SIZE;
     }
     case YSCBOperationType::Update: {
-      auto offset = (rand() % num_cachelines) * CACHE_LINE_SIZE;
       buffer_manager.pin_exclusive(page_id);
       simulate_cacheline_nontemporal_store(ptr + offset);
       buffer_manager.unpin_exclusive(page_id);
@@ -297,52 +345,6 @@ inline uint64_t execute_ycsb_action(const YCSBTable& table, BufferManager& buffe
     }
     default:
       Fail("Operation not supported");
-  }
-}
-
-template <typename Fixture>
-inline void run_ycsb(Fixture& fixture, benchmark::State& state) {
-  micro_benchmark_clear_cache();
-
-  auto bytes_processed = uint64_t{0};
-
-  hdr_histogram* local_latency_histogram;
-  init_histogram(&local_latency_histogram);
-
-  std::map<YSCBOperationType, uint64_t> operation_counts;
-
-  for (auto _ : state) {
-    const auto start = state.thread_index() * fixture.operations_per_thread;
-    const auto end = start + fixture.operations_per_thread;
-    for (auto i = start; i < end; ++i) {
-      const auto op = fixture.operations[i];
-      operation_counts[op.second]++;
-      const auto timer_start = std::chrono::high_resolution_clock::now();
-      bytes_processed += execute_ycsb_action(fixture.table, fixture.buffer_manager, op);
-      const auto timer_end = std::chrono::high_resolution_clock::now();
-      const auto latency = std::chrono::duration_cast<std::chrono::nanoseconds>(timer_end - timer_start).count();
-      hdr_record_value(local_latency_histogram, latency);
-    }
-    {
-      std::lock_guard<std::mutex> lock{fixture.latency_histogram_mutex};
-      hdr_add(fixture.latency_histogram, local_latency_histogram);
-      hdr_close(local_latency_histogram);
-    }
-    benchmark::ClobberMemory();
-  }
-  state.SetItemsProcessed(fixture.operations_per_thread);
-  state.SetBytesProcessed(bytes_processed);
-
-  if (state.thread_index() == 0) {
-    state.counters["cache_hit_rate"] = fixture.buffer_manager.metrics()->hit_rate();
-    state.counters["latency_mean"] = hdr_mean(fixture.latency_histogram);
-    state.counters["latency_stddev"] = hdr_stddev(fixture.latency_histogram);
-    state.counters["latency_median"] = hdr_value_at_percentile(fixture.latency_histogram, 50.0);
-    state.counters["latency_min"] = hdr_min(fixture.latency_histogram);
-    state.counters["latency_max"] = hdr_max(fixture.latency_histogram);
-    state.counters["latency_95percentile"] = hdr_value_at_percentile(fixture.latency_histogram, 95.0);
-    state.counters["bytes_written_to_ssd"] = fixture.buffer_manager.metrics()->total_bytes_copied_to_ssd.load();
-    state.counters["bytes_read_from_ssd"] = fixture.buffer_manager.metrics()->total_bytes_copied_from_ssd.load();
   }
 }
 
