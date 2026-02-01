@@ -25,20 +25,39 @@ class SieveEviction : public EvictionStrategy {
   std::size_t memory_consumption() const override;
 
  private:
-  // Removes one item at index `idx` (must be valid under lock) and moves hand one step "toward tail".
-  void _erase_at_and_advance_locked(const std::size_t idx);
+  struct Slot {
+    EvictionItem item;
+    bool valid{false};
+  };
 
   // Advances the hand one step "toward tail" (toward 0, wrapping) under lock.
   void _advance_hand_locked();
+  
+  bool _advance_hand_to_prev_valid_from_locked(std::size_t start_idx);
 
-  // Purge helper: remove the entry at `this_hand` if it is still the current hand position.
+  // Advances the hand to the previous valid entry. Returns false if no valid entry exists.
+  bool _advance_hand_to_prev_valid_locked();
+
+  // Marks the slot at idx invalid (tombstone) and advances hand to previous valid.
+  void _invalidate_at_and_advance_locked(const std::size_t idx);
+
+  // Purge helper: invalidate the entry at `this_hand` if it is still the current hand position.
   void purge_item(std::shared_lock<std::shared_mutex>& shared_lock, std::size_t this_hand);
 
- private:
-  std::vector<EvictionItem> _eviction_vector;
+  // Compacts away tombstones. Must be called with unique lock held.
+  void _compact_if_needed_locked();
 
-  // Always maintained as an index in [0, _eviction_vector.size()) whenever vector non-empty.
+ private:
+  std::vector<Slot> _eviction_vector;
+
+  // Always maintained as an index in [0, _eviction_vector.size()) whenever there is at least one valid entry.
   std::atomic<std::size_t> _hand;
+
+  // Number of valid entries (not tombstoned). Protected by _mutex.
+  std::size_t _live_entries{0};
+
+  // Number of tombstones. Protected by _mutex.
+  std::size_t _tombstones{0};
 
   mutable std::shared_mutex _mutex;
 };

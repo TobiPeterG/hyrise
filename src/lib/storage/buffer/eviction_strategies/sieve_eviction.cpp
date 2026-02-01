@@ -32,28 +32,111 @@ void SieveEviction::_advance_hand_locked() {
   _hand.store(next, std::memory_order_relaxed);
 }
 
-void SieveEviction::_erase_at_and_advance_locked(const std::size_t idx) {
-  DebugAssert(!_eviction_vector.empty(), "erase requires non-empty vector");
-  DebugAssert(idx < _eviction_vector.size(), "erase index out of bounds");
+bool SieveEviction::_advance_hand_to_prev_valid_from_locked(std::size_t start_idx) {
+  if (_live_entries == 0 || _eviction_vector.empty()) {
+    _hand.store(0, std::memory_order_relaxed);
+    return false;
+  }
 
-  _eviction_vector.erase(_eviction_vector.begin() + idx);
+  // Start strictly before start_idx (one step toward tail)
+  auto idx = prev_index_or_wrap(start_idx % _eviction_vector.size(), _eviction_vector.size());
 
-  if (_eviction_vector.empty()) {
+  for (std::size_t i = 0; i < _eviction_vector.size(); ++i) {
+    if (_eviction_vector[idx].valid) {
+      _hand.store(idx, std::memory_order_relaxed);
+      return true;
+    }
+    idx = prev_index_or_wrap(idx, _eviction_vector.size());
+  }
+
+  _hand.store(0, std::memory_order_relaxed);
+  return false;
+}
+
+bool SieveEviction::_advance_hand_to_prev_valid_locked() {
+  if (_live_entries == 0 || _eviction_vector.empty()) {
+    _hand.store(0, std::memory_order_relaxed);
+    return false;
+  }
+
+  // Try at most vector.size() steps to find a valid slot.
+  auto idx = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
+  for (std::size_t i = 0; i < _eviction_vector.size(); ++i) {
+    if (_eviction_vector[idx].valid) {
+      _hand.store(idx, std::memory_order_relaxed);
+      return true;
+    }
+    idx = prev_index_or_wrap(idx, _eviction_vector.size());
+  }
+
+  // Should not happen if _live_entries > 0
+  _hand.store(0, std::memory_order_relaxed);
+  return false;
+}
+
+void SieveEviction::_invalidate_at_and_advance_locked(const std::size_t idx) {
+  DebugAssert(!_eviction_vector.empty(), "invalidate requires non-empty vector");
+  DebugAssert(idx < _eviction_vector.size(), "invalidate index out of bounds");
+
+  if (_eviction_vector[idx].valid) {
+    _eviction_vector[idx].valid = false;
+    DebugAssert(_live_entries > 0, "live entry underflow");
+    --_live_entries;
+    ++_tombstones;
+  }
+
+  if (_live_entries == 0) {
     _hand.store(0, std::memory_order_relaxed);
     return;
   }
 
-  // Continue scanning in the same direction (toward tail), i.e., move to previous index.
-  const auto next = prev_index_or_wrap(idx % _eviction_vector.size(), _eviction_vector.size());
-  _hand.store(next, std::memory_order_relaxed);
+  // Continue scanning in the same direction (toward tail), i.e., move to previous valid.
+  _hand.store(prev_index_or_wrap(idx, _eviction_vector.size()), std::memory_order_relaxed);
+  (void)_advance_hand_to_prev_valid_locked();
+}
+
+void SieveEviction::_compact_if_needed_locked() {
+  // Keep this cheap and conservative: compact only if there is clear benefit.
+  // This keeps SIEVE behavior (order) while avoiding unbounded tombstone scanning.
+  if (_tombstones == 0) return;
+
+  // Heuristic: compact if tombstones dominate or vector got very sparse.
+  // - If more than half are tombstones OR
+  // - If vector is 4x larger than live set (very sparse).
+  const auto size = _eviction_vector.size();
+  if (size == 0) return;
+
+  if (!(_tombstones > size / 2 || size > (_live_entries * 4 + 64))) {
+    return;
+  }
+
+  std::vector<Slot> compacted;
+  compacted.reserve(_live_entries);
+
+  // Preserve order of remaining entries.
+  for (const auto& s : _eviction_vector) {
+    if (s.valid) {
+      compacted.push_back(s);
+    }
+  }
+
+  _eviction_vector.swap(compacted);
+  _tombstones = 0;
+
+  // Reset hand to head (end) as in add_eviction_candidate when list becomes non-empty.
+  if (_live_entries > 0 && !_eviction_vector.empty()) {
+    _hand.store(_eviction_vector.size() - 1, std::memory_order_relaxed);
+  } else {
+    _hand.store(0, std::memory_order_relaxed);
+  }
 }
 
 void SieveEviction::purge_item(std::shared_lock<std::shared_mutex>& shared_lock, const std::size_t this_hand) {
-  // We observed this candidate under shared lock. To erase, we need unique.
+  // We observed this candidate under shared lock. To invalidate, we need unique.
   shared_lock.unlock();
   std::unique_lock unique_lock{_mutex};
 
-  if (_eviction_vector.empty()) {
+  if (_live_entries == 0 || _eviction_vector.empty()) {
     return;
   }
 
@@ -63,7 +146,8 @@ void SieveEviction::purge_item(std::shared_lock<std::shared_mutex>& shared_lock,
     return;
   }
 
-  _erase_at_and_advance_locked(this_hand);
+  _invalidate_at_and_advance_locked(this_hand);
+  _compact_if_needed_locked();
   increment_counter(_buffer_pool.metrics->num_eviction_queue_items_purged);
 }
 
@@ -86,12 +170,13 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
     std::size_t max_scans = 0;
     {
       std::shared_lock shared_lock{_mutex};
-      if (_eviction_vector.empty()) {
+      if (_live_entries == 0 || _eviction_vector.empty()) {
         increment_counter(_buffer_pool.metrics->num_eviction_failures);
         _buffer_pool.free_bytes(bytes_required);
         return false;
       }
-      max_scans = _eviction_vector.size() * 2 + 1;
+      // Use live entries here (not vector size) to avoid tombstones inflating scan budget.
+      max_scans = _live_entries * 2 + 1;
     }
 
     for (std::size_t scans = 0; scans < max_scans &&
@@ -99,16 +184,28 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
          ++scans) {
       std::shared_lock shared_lock{_mutex};
 
-      if (_eviction_vector.empty()) {
+      if (_live_entries == 0 || _eviction_vector.empty()) {
         increment_counter(_buffer_pool.metrics->num_eviction_failures);
         _buffer_pool.free_bytes(bytes_required);
         return false;
       }
 
-      // SIEVE: end is head (new), begin is tail (old).
-      // Our hand moves from head toward tail by decrementing index with wrap.
-      const auto this_hand = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
-      const auto item = _eviction_vector[this_hand];
+      // Ensure hand points to a valid slot. If it doesn't, advance under unique lock.
+      auto this_hand = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
+      if (!_eviction_vector[this_hand].valid) {
+        shared_lock.unlock();
+        std::unique_lock unique_lock{_mutex};
+        if (_live_entries == 0 || _eviction_vector.empty()) {
+          increment_counter(_buffer_pool.metrics->num_eviction_failures);
+          _buffer_pool.free_bytes(bytes_required);
+          return false;
+        }
+        (void)_advance_hand_to_prev_valid_locked();
+        _compact_if_needed_locked();
+        continue;
+      }
+
+      const auto item = _eviction_vector[this_hand].item;
 
       increment_counter(_buffer_pool.metrics->num_eviction_candidate_inspections);
 
@@ -133,7 +230,7 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
         increment_counter(_buffer_pool.metrics->num_eviction_requeues_pinned);
         shared_lock.unlock();
         std::unique_lock unique_lock{_mutex};
-        _advance_hand_locked();
+        (void)_advance_hand_to_prev_valid_from_locked(this_hand);
         continue;
       }
 
@@ -143,7 +240,7 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
         frame->clear_reference();
         shared_lock.unlock();
         std::unique_lock unique_lock{_mutex};
-        _advance_hand_locked();
+        (void)_advance_hand_to_prev_valid_from_locked(this_hand);
         continue;
       }
 
@@ -152,7 +249,7 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
         increment_counter(_buffer_pool.metrics->num_eviction_requeues_lock_failed);
         shared_lock.unlock();
         std::unique_lock unique_lock{_mutex};
-        _advance_hand_locked();
+        (void)_advance_hand_to_prev_valid_from_locked(this_hand);
         continue;
       }
 
@@ -160,11 +257,11 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
              "Memory node mismatch: " + std::to_string(frame->node_id()) + " != " + std::to_string(_buffer_pool.node_id));
 
       // We have the victim frame exclusively locked.
-      // Now remove the victim from the vector under unique lock, but only if hand still matches.
+      // Now invalidate the victim slot under unique lock, but only if hand still matches.
       shared_lock.unlock();
       std::unique_lock unique_lock{_mutex};
 
-      if (_eviction_vector.empty()) {
+      if (_live_entries == 0 || _eviction_vector.empty()) {
         frame->unlock_exclusive();
         continue;
       }
@@ -175,8 +272,14 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
         continue;
       }
 
-      // Erase victim and advance hand (still under lock)
-      _erase_at_and_advance_locked(this_hand);
+      if (!_eviction_vector[this_hand].valid) {
+        frame->unlock_exclusive();
+        continue;
+      }
+
+      // Invalidate victim and advance hand (still under lock)
+      _invalidate_at_and_advance_locked(this_hand);
+      _compact_if_needed_locked();
 
       // Evict while still holding the frame exclusively locked (vector lock released)
       auto evict_item = item;
@@ -213,13 +316,17 @@ void SieveEviction::add_eviction_candidate(const PageID& page_id, Frame* const f
 
   std::unique_lock lock{_mutex};
 
-  const auto was_empty = _eviction_vector.empty();
-  _eviction_vector.push_back({page_id, Frame::version(current_state_and_version)});
+  const auto was_empty = (_live_entries == 0);
+
+  _eviction_vector.push_back(Slot{{page_id, Frame::version(current_state_and_version)}, true});
+  ++_live_entries;
 
   // New objects at head (end). When list becomes non-empty, start hand at head.
   if (was_empty) {
     _hand.store(_eviction_vector.size() - 1, std::memory_order_relaxed);
   }
+
+  _compact_if_needed_locked();
 
   // I'm using the end of the vector as what the SIEVE paper calls the head. This is because I believe adding elements
   // in the beginning would always cause moving all other values (at least in the usual std:: implementation of a
@@ -229,12 +336,22 @@ void SieveEviction::add_eviction_candidate(const PageID& page_id, Frame* const f
 void SieveEviction::purge_eviction_candidates() {
   for (auto i = std::size_t{0}; i < MAX_EVICTION_QUEUE_PURGES; ++i) {
     std::shared_lock shared_lock{_mutex};
-    if (_eviction_vector.empty()) {
+    if (_live_entries == 0 || _eviction_vector.empty()) {
       return;
     }
 
-    const auto this_hand = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
-    const auto item = _eviction_vector[this_hand];
+    auto this_hand = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
+    if (!_eviction_vector[this_hand].valid) {
+      shared_lock.unlock();
+      std::unique_lock unique_lock{_mutex};
+      if (_live_entries == 0 || _eviction_vector.empty()) return;
+      (void)_advance_hand_to_prev_valid_locked();
+      _compact_if_needed_locked();
+      --i;
+      continue;
+    }
+
+    const auto item = _eviction_vector[this_hand].item;
 
     const auto region = _buffer_pool.volatile_regions[static_cast<uint64_t>(item.page_id.size_type())];
     auto frame = region->get_frame(item.page_id);
@@ -252,7 +369,7 @@ void SieveEviction::purge_eviction_candidates() {
 }
 
 std::size_t SieveEviction::memory_consumption() const {
-  return sizeof(*this) + sizeof(_eviction_vector) + sizeof(EvictionItem) * _eviction_vector.size();
+  return sizeof(*this) + sizeof(_eviction_vector) + sizeof(Slot) * _eviction_vector.capacity();
 }
 
 }  // namespace hyrise
