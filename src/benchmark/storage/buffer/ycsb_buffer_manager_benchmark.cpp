@@ -437,7 +437,7 @@ constexpr int kMaxDbGiB = 8;
 constexpr int kDbStep = 1;
 
 constexpr int kIterations = 1;
-constexpr int kRepetitions = 3;
+constexpr int kRepetitions = 10;
 
 // Helper to configure the same argument grid for all registered benchmarks.
 inline void configure_common(benchmark::internal::Benchmark* b) {
