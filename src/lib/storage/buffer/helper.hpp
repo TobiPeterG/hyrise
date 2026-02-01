@@ -131,10 +131,10 @@ enum class AccessIntent { Read, Write };
 
 boost::container::pmr::memory_resource* get_buffer_manager_memory_resource();
 
-inline void DebugAssertPageAligned(const void* data) {
-  DebugAssert(reinterpret_cast<std::uintptr_t>(data) % PAGE_ALIGNMENT == 0,
-              "Destination is not properly aligned to 512: " +
-                  std::to_string(reinterpret_cast<std::uintptr_t>(data) % PAGE_ALIGNMENT));
+static inline void require_aligned_or_fail(const void* p) {
+  if ((reinterpret_cast<std::uintptr_t>(p) % PAGE_ALIGNMENT) != 0) {
+    Fail("SSDRegion: buffer must be aligned to " + std::to_string(PAGE_ALIGNMENT) + " bytes");
+  }
 }
 
 // Busy waiting with backoff

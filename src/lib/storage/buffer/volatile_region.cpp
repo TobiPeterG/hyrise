@@ -18,7 +18,7 @@ VolatileRegion::VolatileRegion(const PageSizeType size_type, std::byte* region_s
       _frames(std::min(INITIAL_SLOTS_PER_REGION, (region_end - region_start) / bytes_for_size_type(size_type))),
       _free_slots(std::min(INITIAL_SLOTS_PER_REGION, (region_end - region_start) / bytes_for_size_type(size_type))),
       _metrics(metrics) {
-  DebugAssertPageAligned(region_start);
+  require_aligned_or_fail(region_start);
   DebugAssert(region_start < region_end, "Region is too small");
   DebugAssert(static_cast<size_t>(region_end - region_start) < DEFAULT_RESERVED_VIRTUAL_MEMORY,
               "Region start and end dont match");
@@ -120,7 +120,7 @@ std::tuple<PageID, Frame*, std::byte*> VolatileRegion::allocate() {
 std::byte* VolatileRegion::get_page(PageID page_id) {
   const auto num_bytes = bytes_for_size_type(_size_type);
   auto data = _region_start + page_id.index * num_bytes;
-  DebugAssertPageAligned(data);
+  require_aligned_or_fail(data);
   return data;
 }
 
