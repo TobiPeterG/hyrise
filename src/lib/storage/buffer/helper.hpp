@@ -1,5 +1,6 @@
 #pragma once
 
+#include <boost/functional/hash_fwd.hpp>
 #include <tbb/concurrent_queue.h>
 
 #include <bit>
@@ -158,3 +159,14 @@ std::array<std::shared_ptr<VolatileRegion>, NUM_PAGE_SIZE_TYPES> create_volatile
 void unmap_region(std::byte* region);
 
 }  // namespace hyrise
+
+template <>
+struct std::hash<hyrise::PageID> {
+  std::size_t operator()(const hyrise::PageID& page_id) const noexcept {
+    std::size_t seed = 0;
+    boost::hash_combine(seed, page_id.index);
+    boost::hash_combine(seed, page_id._size_type);
+
+    return seed;
+  }
+};

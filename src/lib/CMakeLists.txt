@@ -492,6 +492,12 @@ set(
     storage/buffer/helper.hpp
     storage/buffer/volatile_region.cpp
     storage/buffer/volatile_region.hpp
+    storage/buffer/eviction_strategies/second_chance_eviction.cpp
+    storage/buffer/eviction_strategies/second_chance_eviction.hpp
+    storage/buffer/eviction_strategies/sieve_eviction.cpp
+    storage/buffer/eviction_strategies/sieve_eviction.hpp
+    storage/buffer/eviction_strategies/s3_fifo_eviction.cpp
+    storage/buffer/eviction_strategies/s3_fifo_eviction.hpp
     storage/dictionary_segment.cpp
     storage/dictionary_segment.hpp
     storage/dictionary_segment/attribute_vector_iterable.hpp
