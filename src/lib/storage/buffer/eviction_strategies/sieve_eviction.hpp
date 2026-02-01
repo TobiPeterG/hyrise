@@ -2,7 +2,7 @@
 
 #include <atomic>
 #include <cstddef>
-#include <shared_mutex>
+#include <mutex>
 #include <vector>
 
 #include <storage/buffer/eviction_strategy.hpp>
@@ -32,20 +32,27 @@ class SieveEviction : public EvictionStrategy {
 
   // Advances the hand one step "toward tail" (toward 0, wrapping) under lock.
   void _advance_hand_locked();
-  
+
+  // Advances hand to previous valid entry, starting strictly before `start_idx` (one step toward tail).
   bool _advance_hand_to_prev_valid_from_locked(std::size_t start_idx);
 
   // Advances the hand to the previous valid entry. Returns false if no valid entry exists.
   bool _advance_hand_to_prev_valid_locked();
 
+  // Advances hand by `skip_steps` (toward tail) and then finds the next valid entry.
+  bool _advance_hand_skip_and_find_prev_valid_from_locked(std::size_t start_idx, std::size_t skip_steps);
+
   // Marks the slot at idx invalid (tombstone) and advances hand to previous valid.
   void _invalidate_at_and_advance_locked(const std::size_t idx);
 
-  // Purge helper: invalidate the entry at `this_hand` if it is still the current hand position.
-  void purge_item(std::shared_lock<std::shared_mutex>& shared_lock, std::size_t this_hand);
+  // Marks the slot at idx invalid (tombstone) without changing the hand.
+  void _invalidate_at_locked(const std::size_t idx);
 
-  // Compacts away tombstones. Must be called with unique lock held.
+  // Compacts away tombstones. Must be called with lock held.
   void _compact_if_needed_locked();
+
+  // Returns false if there is no valid candidate. If true, outputs (idx,item).
+  bool _pick_current_candidate_locked(std::size_t& out_idx, EvictionItem& out_item);
 
  private:
   std::vector<Slot> _eviction_vector;
@@ -59,7 +66,7 @@ class SieveEviction : public EvictionStrategy {
   // Number of tombstones. Protected by _mutex.
   std::size_t _tombstones{0};
 
-  mutable std::shared_mutex _mutex;
+  mutable std::mutex _mutex;
 };
 
 }  // namespace hyrise

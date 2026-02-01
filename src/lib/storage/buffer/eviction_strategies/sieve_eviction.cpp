@@ -1,3 +1,5 @@
+#include <limits>
+
 #include "sieve_eviction.hpp"
 
 #include <storage/buffer/buffer_pool.hpp>
@@ -9,6 +11,19 @@ namespace hyrise {
 namespace {
 EvictionStrategyRegistrar s_sieve_registrar{
     "sieve", [](BufferPool& buffer_pool) { return std::make_unique<SieveEviction>(buffer_pool); }, {"SIEVE"}};
+
+// Adaptive skip on pinned/lockfail hotspots.
+// Start close to canonical SIEVE, increase only on repeated failures at the same hand index.
+constexpr std::size_t SIEVE_BASE_SKIP_ON_PINNED = 2;
+constexpr std::size_t SIEVE_BASE_SKIP_ON_LOCKFAIL = 2;
+constexpr std::size_t SIEVE_SKIP_ON_REFERENCED = 1;  // canonical: advance by one
+constexpr std::size_t SIEVE_MAX_SKIP = 16;
+
+// Bounded work, adaptive.
+// Start small when contention is low; grow only when we make no progress.
+constexpr std::size_t SIEVE_SCAN_MULTIPLIER_MIN = 2;
+constexpr std::size_t SIEVE_SCAN_MULTIPLIER_MAX = 8;
+
 }  // namespace
 
 SieveEviction::SieveEviction(BufferPool& buffer_pool) : EvictionStrategy(buffer_pool), _hand(0) {}
@@ -40,7 +55,6 @@ bool SieveEviction::_advance_hand_to_prev_valid_from_locked(std::size_t start_id
 
   // Start strictly before start_idx (one step toward tail)
   auto idx = prev_index_or_wrap(start_idx % _eviction_vector.size(), _eviction_vector.size());
-
   for (std::size_t i = 0; i < _eviction_vector.size(); ++i) {
     if (_eviction_vector[idx].valid) {
       _hand.store(idx, std::memory_order_relaxed);
@@ -74,7 +88,30 @@ bool SieveEviction::_advance_hand_to_prev_valid_locked() {
   return false;
 }
 
-void SieveEviction::_invalidate_at_and_advance_locked(const std::size_t idx) {
+bool SieveEviction::_advance_hand_skip_and_find_prev_valid_from_locked(std::size_t start_idx, std::size_t skip_steps) {
+  if (_live_entries == 0 || _eviction_vector.empty()) {
+    _hand.store(0, std::memory_order_relaxed);
+    return false;
+  }
+
+  auto idx = start_idx % _eviction_vector.size();
+  for (std::size_t s = 0; s < skip_steps; ++s) {
+    idx = prev_index_or_wrap(idx, _eviction_vector.size());
+  }
+
+  for (std::size_t i = 0; i < _eviction_vector.size(); ++i) {
+    if (_eviction_vector[idx].valid) {
+      _hand.store(idx, std::memory_order_relaxed);
+      return true;
+    }
+    idx = prev_index_or_wrap(idx, _eviction_vector.size());
+  }
+
+  _hand.store(0, std::memory_order_relaxed);
+  return false;
+}
+
+void SieveEviction::_invalidate_at_locked(const std::size_t idx) {
   DebugAssert(!_eviction_vector.empty(), "invalidate requires non-empty vector");
   DebugAssert(idx < _eviction_vector.size(), "invalidate index out of bounds");
 
@@ -84,6 +121,13 @@ void SieveEviction::_invalidate_at_and_advance_locked(const std::size_t idx) {
     --_live_entries;
     ++_tombstones;
   }
+}
+
+void SieveEviction::_invalidate_at_and_advance_locked(const std::size_t idx) {
+  DebugAssert(!_eviction_vector.empty(), "invalidate requires non-empty vector");
+  DebugAssert(idx < _eviction_vector.size(), "invalidate index out of bounds");
+
+  _invalidate_at_locked(idx);
 
   if (_live_entries == 0) {
     _hand.store(0, std::memory_order_relaxed);
@@ -96,15 +140,12 @@ void SieveEviction::_invalidate_at_and_advance_locked(const std::size_t idx) {
 }
 
 void SieveEviction::_compact_if_needed_locked() {
-  // Keep this cheap and conservative: compact only if there is clear benefit.
-  // This keeps SIEVE behavior (order) while avoiding unbounded tombstone scanning.
-  if (_tombstones == 0) return;
+  if (_tombstones == 0)
+    return;
 
-  // Heuristic: compact if tombstones dominate or vector got very sparse.
-  // - If more than half are tombstones OR
-  // - If vector is 4x larger than live set (very sparse).
   const auto size = _eviction_vector.size();
-  if (size == 0) return;
+  if (size == 0)
+    return;
 
   if (!(_tombstones > size / 2 || size > (_live_entries * 4 + 64))) {
     return;
@@ -115,9 +156,8 @@ void SieveEviction::_compact_if_needed_locked() {
 
   // Preserve order of remaining entries.
   for (const auto& s : _eviction_vector) {
-    if (s.valid) {
+    if (s.valid)
       compacted.push_back(s);
-    }
   }
 
   _eviction_vector.swap(compacted);
@@ -131,81 +171,86 @@ void SieveEviction::_compact_if_needed_locked() {
   }
 }
 
-void SieveEviction::purge_item(std::shared_lock<std::shared_mutex>& shared_lock, const std::size_t this_hand) {
-  // We observed this candidate under shared lock. To invalidate, we need unique.
-  shared_lock.unlock();
-  std::unique_lock unique_lock{_mutex};
+bool SieveEviction::_pick_current_candidate_locked(std::size_t& out_idx, EvictionItem& out_item) {
+  if (_live_entries == 0 || _eviction_vector.empty())
+    return false;
 
-  if (_live_entries == 0 || _eviction_vector.empty()) {
-    return;
+  auto idx = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
+  if (!_eviction_vector[idx].valid) {
+    (void)_advance_hand_to_prev_valid_locked();
+    if (_live_entries == 0 || _eviction_vector.empty())
+      return false;
+    idx = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
+    if (!_eviction_vector[idx].valid)
+      return false;
   }
 
-  // Only purge if the hand still points to the same logical position.
-  const auto cur = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
-  if (cur != this_hand) {
-    return;
-  }
-
-  _invalidate_at_and_advance_locked(this_hand);
-  _compact_if_needed_locked();
-  increment_counter(_buffer_pool.metrics->num_eviction_queue_items_purged);
+  out_idx = idx;
+  out_item = _eviction_vector[idx].item;
+  return true;
 }
 
 bool SieveEviction::perform_evictions(const PageSizeType required_size) {
   const auto bytes_required = bytes_for_size_type(required_size);
-
   _buffer_pool.reserve_bytes(bytes_required);
 
-  // We must ensure progress: if everything is pinned / constantly referenced / lock-failing,
-  // do a bounded scan and fail (rolling back the reservation) rather than spinning forever.
   bool counted_episode = false;
+  bool evicted_any_in_call = false;
+
+  // Adaptive scan multiplier control:
+  // if we do bounded work but cannot evict (still oversubscribed), we gradually increase the scan budget.
+  std::size_t no_progress_rounds = 0;
+
+  // Adaptive skip control for hot spots (pinned / lock-fail) on the same index
+  std::size_t pinned_last_idx = std::numeric_limits<std::size_t>::max();
+  std::size_t pinned_streak = 0;
+
+  std::size_t lockfail_last_idx = std::numeric_limits<std::size_t>::max();
+  std::size_t lockfail_streak = 0;
+
+  auto adaptive_skip = [](const std::size_t base, const std::size_t max, const std::size_t streak) {
+    // streak: 0 => base, 1 => base*2, 2 => base*4, 3+ => base*8 ... capped
+    const auto shift = std::min<std::size_t>(streak, 3);  // cap growth steps
+    const auto skip = base << shift;
+    return std::min(max, skip);
+  };
+
   while (_buffer_pool.used_bytes.load(std::memory_order_relaxed) > _buffer_pool.max_bytes) {
     if (!counted_episode) {
       increment_counter(_buffer_pool.metrics->num_oversubscription_episodes);
       counted_episode = true;
     }
 
-    // Bound the number of "inspections" per oversubscription episode.
-    // 2x is usually enough to clear references once and come back around.
-    std::size_t max_scans = 0;
+    std::size_t live_snapshot = 0;
     {
-      std::shared_lock shared_lock{_mutex};
-      if (_live_entries == 0 || _eviction_vector.empty()) {
+      std::lock_guard<std::mutex> lk(_mutex);
+      live_snapshot = _live_entries;
+      if (live_snapshot == 0 || _eviction_vector.empty()) {
         increment_counter(_buffer_pool.metrics->num_eviction_failures);
         _buffer_pool.free_bytes(bytes_required);
         return false;
       }
-      // Use live entries here (not vector size) to avoid tombstones inflating scan budget.
-      max_scans = _live_entries * 2 + 1;
     }
 
-    for (std::size_t scans = 0; scans < max_scans &&
-                                _buffer_pool.used_bytes.load(std::memory_order_relaxed) > _buffer_pool.max_bytes;
+    // Adaptive bounded scan budget: 2,4,6,8 depending on consecutive no-progress rounds.
+    const auto scan_multiplier = std::min<std::size_t>(
+        SIEVE_SCAN_MULTIPLIER_MAX, SIEVE_SCAN_MULTIPLIER_MIN + std::min<std::size_t>(no_progress_rounds, 3) * 2);
+
+    const auto max_scans = live_snapshot * scan_multiplier + 1;
+    bool evicted_in_this_round = false;
+
+    for (std::size_t scans = 0;
+         scans < max_scans && _buffer_pool.used_bytes.load(std::memory_order_relaxed) > _buffer_pool.max_bytes;
          ++scans) {
-      std::shared_lock shared_lock{_mutex};
+      std::size_t this_idx = 0;
+      EvictionItem item{};
 
-      if (_live_entries == 0 || _eviction_vector.empty()) {
-        increment_counter(_buffer_pool.metrics->num_eviction_failures);
-        _buffer_pool.free_bytes(bytes_required);
-        return false;
-      }
-
-      // Ensure hand points to a valid slot. If it doesn't, advance under unique lock.
-      auto this_hand = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
-      if (!_eviction_vector[this_hand].valid) {
-        shared_lock.unlock();
-        std::unique_lock unique_lock{_mutex};
-        if (_live_entries == 0 || _eviction_vector.empty()) {
-          increment_counter(_buffer_pool.metrics->num_eviction_failures);
-          _buffer_pool.free_bytes(bytes_required);
-          return false;
+      {
+        std::lock_guard<std::mutex> lk(_mutex);
+        if (!_pick_current_candidate_locked(this_idx, item)) {
+          break;
         }
-        (void)_advance_hand_to_prev_valid_locked();
-        _compact_if_needed_locked();
-        continue;
       }
-
-      const auto item = _eviction_vector[this_hand].item;
 
       increment_counter(_buffer_pool.metrics->num_eviction_candidate_inspections);
 
@@ -213,91 +258,151 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
       auto frame = region->get_frame(item.page_id);
       const auto current_state_and_version = frame->state_and_version();
 
-      // Migrated entry -> purge
+      // Migrated entry -> tombstone (only if identity still matches slot)
       if (frame->node_id() != _buffer_pool.node_id) {
-        purge_item(shared_lock, this_hand);
+        std::lock_guard<std::mutex> lk(_mutex);
+        if (this_idx < _eviction_vector.size()) {
+          auto& slot = _eviction_vector[this_idx];
+          if (slot.valid && slot.item.page_id == item.page_id && slot.item.timestamp == item.timestamp) {
+            _invalidate_at_and_advance_locked(this_idx);
+            increment_counter(_buffer_pool.metrics->num_eviction_queue_items_purged);
+          } else if (_live_entries > 0) {
+            (void)_advance_hand_to_prev_valid_locked();
+          }
+        }
         continue;
       }
 
-      // Stale entry (frame generation changed) -> purge
+      // Stale entry -> tombstone (only if identity still matches slot)
       if (Frame::version(current_state_and_version) != item.timestamp) {
-        purge_item(shared_lock, this_hand);
+        std::lock_guard<std::mutex> lk(_mutex);
+        if (this_idx < _eviction_vector.size()) {
+          auto& slot = _eviction_vector[this_idx];
+          if (slot.valid && slot.item.page_id == item.page_id && slot.item.timestamp == item.timestamp) {
+            _invalidate_at_and_advance_locked(this_idx);
+            increment_counter(_buffer_pool.metrics->num_eviction_queue_items_purged);
+          } else if (_live_entries > 0) {
+            (void)_advance_hand_to_prev_valid_locked();
+          }
+        }
         continue;
       }
 
-      // Not evictable now (pinned / locked) -> advance hand under unique lock
+      // Pinned -> adaptive skip (start small; grow only when stuck on same idx)
       if (Frame::state(current_state_and_version) != Frame::UNLOCKED) {
         increment_counter(_buffer_pool.metrics->num_eviction_requeues_pinned);
-        shared_lock.unlock();
-        std::unique_lock unique_lock{_mutex};
-        (void)_advance_hand_to_prev_valid_from_locked(this_hand);
+
+        std::lock_guard<std::mutex> lk(_mutex);
+        if (_live_entries > 0 && !_eviction_vector.empty()) {
+          if (this_idx == pinned_last_idx) {
+            ++pinned_streak;
+          } else {
+            pinned_last_idx = this_idx;
+            pinned_streak = 0;
+          }
+          const auto skip = adaptive_skip(SIEVE_BASE_SKIP_ON_PINNED, SIEVE_MAX_SKIP, pinned_streak);
+          (void)_advance_hand_skip_and_find_prev_valid_from_locked(this_idx, skip);
+        }
         continue;
       }
 
-      // SIEVE visited/reference bit: clear on first visit, keep item in place, advance hand.
+      // Referenced -> clear and advance by 1 (canonical SIEVE behavior)
       if (Frame::is_referenced(current_state_and_version)) {
         increment_counter(_buffer_pool.metrics->num_eviction_requeues_referenced);
         frame->clear_reference();
-        shared_lock.unlock();
-        std::unique_lock unique_lock{_mutex};
-        (void)_advance_hand_to_prev_valid_from_locked(this_hand);
+
+        // Referenced is not a "hotspot" signal; reset hotspot streaks so we don't over-skip.
+        pinned_last_idx = std::numeric_limits<std::size_t>::max();
+        pinned_streak = 0;
+        lockfail_last_idx = std::numeric_limits<std::size_t>::max();
+        lockfail_streak = 0;
+
+        std::lock_guard<std::mutex> lk(_mutex);
+        if (_live_entries > 0 && !_eviction_vector.empty()) {
+          (void)_advance_hand_skip_and_find_prev_valid_from_locked(this_idx, SIEVE_SKIP_ON_REFERENCED);
+        }
         continue;
       }
 
-      // Try locking the frame exclusively; if it fails, advance hand and retry.
+      // Lock-fail -> adaptive skip (start small; grow only when stuck on same idx)
       if (!frame->try_lock_exclusive(current_state_and_version)) {
         increment_counter(_buffer_pool.metrics->num_eviction_requeues_lock_failed);
-        shared_lock.unlock();
-        std::unique_lock unique_lock{_mutex};
-        (void)_advance_hand_to_prev_valid_from_locked(this_hand);
+
+        std::lock_guard<std::mutex> lk(_mutex);
+        if (_live_entries > 0 && !_eviction_vector.empty()) {
+          if (this_idx == lockfail_last_idx) {
+            ++lockfail_streak;
+          } else {
+            lockfail_last_idx = this_idx;
+            lockfail_streak = 0;
+          }
+          const auto skip = adaptive_skip(SIEVE_BASE_SKIP_ON_LOCKFAIL, SIEVE_MAX_SKIP, lockfail_streak);
+          (void)_advance_hand_skip_and_find_prev_valid_from_locked(this_idx, skip);
+        }
         continue;
       }
 
-      Assert(frame->node_id() == _buffer_pool.node_id,
-             "Memory node mismatch: " + std::to_string(frame->node_id()) + " != " + std::to_string(_buffer_pool.node_id));
+      Assert(frame->node_id() == _buffer_pool.node_id, "Memory node mismatch: " + std::to_string(frame->node_id()) +
+                                                           " != " + std::to_string(_buffer_pool.node_id));
 
-      // We have the victim frame exclusively locked.
-      // Now invalidate the victim slot under unique lock, but only if hand still matches.
-      shared_lock.unlock();
-      std::unique_lock unique_lock{_mutex};
+      // Tombstone under lock, then evict without holding SIEVE lock.
+      {
+        std::lock_guard<std::mutex> lk(_mutex);
+        if (_live_entries == 0 || _eviction_vector.empty() || this_idx >= _eviction_vector.size()) {
+          frame->unlock_exclusive();
+          continue;
+        }
 
-      if (_live_entries == 0 || _eviction_vector.empty()) {
-        frame->unlock_exclusive();
-        continue;
+        auto& slot = _eviction_vector[this_idx];
+
+        // ensure we tombstone the SAME item we picked.
+        if (!slot.valid || slot.item.page_id != item.page_id || slot.item.timestamp != item.timestamp) {
+          frame->unlock_exclusive();
+          if (_live_entries > 0) {
+            (void)_advance_hand_to_prev_valid_locked();
+          }
+          continue;
+        }
+
+        _invalidate_at_and_advance_locked(this_idx);
       }
 
-      const auto hand_now = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
-      if (hand_now != this_hand) {
-        frame->unlock_exclusive();
-        continue;
-      }
+      // Successful eviction resets hotspot streaks (we made progress)
+      pinned_last_idx = std::numeric_limits<std::size_t>::max();
+      pinned_streak = 0;
+      lockfail_last_idx = std::numeric_limits<std::size_t>::max();
+      lockfail_streak = 0;
 
-      if (!_eviction_vector[this_hand].valid) {
-        frame->unlock_exclusive();
-        continue;
-      }
-
-      // Invalidate victim and advance hand (still under lock)
-      _invalidate_at_and_advance_locked(this_hand);
-      _compact_if_needed_locked();
-
-      // Evict while still holding the frame exclusively locked (vector lock released)
       auto evict_item = item;
-      unique_lock.unlock();
-
       _buffer_pool.evict(evict_item, frame);
       increment_counter(_buffer_pool.metrics->num_evictions);
-
-      // Free budget immediately (we reserved bytes_required up-front; evict frees actual bytes).
       _buffer_pool.free_bytes(bytes_for_size_type(evict_item.page_id.size_type()));
+
+      evicted_in_this_round = true;
+      evicted_any_in_call = true;
     }
 
-    // If we're still oversubscribed after a bounded scan, abort
+    // If still oversubscribed:
     if (_buffer_pool.used_bytes.load(std::memory_order_relaxed) > _buffer_pool.max_bytes) {
-      increment_counter(_buffer_pool.metrics->num_eviction_failures);
-      _buffer_pool.free_bytes(bytes_required);
-      return false;
+      // No progress at all in this call => real failure
+      if (!evicted_in_this_round && !evicted_any_in_call) {
+        increment_counter(_buffer_pool.metrics->num_eviction_failures);
+        _buffer_pool.free_bytes(bytes_required);
+        return false;
+      }
+
+      // Progress happened at least once in the call, but this bounded round didn't evict:
+      // increase scan budget next time by bumping no_progress_rounds.
+      if (!evicted_in_this_round) {
+        ++no_progress_rounds;
+      } else {
+        no_progress_rounds = 0;
+      }
+      continue;
     }
+
+    // We are no longer oversubscribed => reset
+    no_progress_rounds = 0;
   }
 
   return true;
@@ -314,7 +419,7 @@ void SieveEviction::add_eviction_candidate(const PageID& page_id, Frame* const f
   DebugAssert(frame->node_id() == _buffer_pool.node_id, "Memory node mismatch");
   increment_counter(_buffer_pool.metrics->num_eviction_queue_adds);
 
-  std::unique_lock lock{_mutex};
+  std::lock_guard<std::mutex> lock{_mutex};
 
   const auto was_empty = (_live_entries == 0);
 
@@ -326,8 +431,6 @@ void SieveEviction::add_eviction_candidate(const PageID& page_id, Frame* const f
     _hand.store(_eviction_vector.size() - 1, std::memory_order_relaxed);
   }
 
-  _compact_if_needed_locked();
-
   // I'm using the end of the vector as what the SIEVE paper calls the head. This is because I believe adding elements
   // in the beginning would always cause moving all other values (at least in the usual std:: implementation of a
   // vector).
@@ -335,31 +438,31 @@ void SieveEviction::add_eviction_candidate(const PageID& page_id, Frame* const f
 
 void SieveEviction::purge_eviction_candidates() {
   for (auto i = std::size_t{0}; i < MAX_EVICTION_QUEUE_PURGES; ++i) {
-    std::shared_lock shared_lock{_mutex};
-    if (_live_entries == 0 || _eviction_vector.empty()) {
-      return;
-    }
+    std::size_t idx = 0;
+    EvictionItem item{};
 
-    auto this_hand = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
-    if (!_eviction_vector[this_hand].valid) {
-      shared_lock.unlock();
-      std::unique_lock unique_lock{_mutex};
-      if (_live_entries == 0 || _eviction_vector.empty()) return;
-      (void)_advance_hand_to_prev_valid_locked();
-      _compact_if_needed_locked();
-      --i;
-      continue;
+    {
+      std::lock_guard<std::mutex> lk(_mutex);
+      if (!_pick_current_candidate_locked(idx, item))
+        return;
     }
-
-    const auto item = _eviction_vector[this_hand].item;
 
     const auto region = _buffer_pool.volatile_regions[static_cast<uint64_t>(item.page_id.size_type())];
     auto frame = region->get_frame(item.page_id);
     const auto current_state_and_version = frame->state_and_version();
 
-    // Purge stale or migrated entries (the only ones that can never become valid again).
+    // Purge stale or migrated entries.
     if (frame->node_id() != _buffer_pool.node_id || Frame::version(current_state_and_version) != item.timestamp) {
-      purge_item(shared_lock, this_hand);
+      std::lock_guard<std::mutex> lk(_mutex);
+      if (idx < _eviction_vector.size()) {
+        auto& slot = _eviction_vector[idx];
+        if (slot.valid && slot.item.page_id == item.page_id && slot.item.timestamp == item.timestamp) {
+          _invalidate_at_and_advance_locked(idx);
+          increment_counter(_buffer_pool.metrics->num_eviction_queue_items_purged);
+        } else if (_live_entries > 0) {
+          (void)_advance_hand_to_prev_valid_locked();
+        }
+      }
       --i;
       continue;
     }
@@ -369,6 +472,7 @@ void SieveEviction::purge_eviction_candidates() {
 }
 
 std::size_t SieveEviction::memory_consumption() const {
+  std::lock_guard<std::mutex> lk(_mutex);
   return sizeof(*this) + sizeof(_eviction_vector) + sizeof(Slot) * _eviction_vector.capacity();
 }
 
