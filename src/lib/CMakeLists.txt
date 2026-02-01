@@ -465,6 +465,10 @@ set(
     storage/buffer/eviction_strategy_registry.hpp
     storage/buffer/eviction_strategies/delayed_fifo_reinsertion_eviction.cpp
     storage/buffer/eviction_strategies/delayed_fifo_reinsertion_eviction.hpp
+    storage/buffer/eviction_strategies/fifo_eviction.cpp
+    storage/buffer/eviction_strategies/fifo_eviction.hpp
+    storage/buffer/eviction_strategies/lru_eviction.cpp
+    storage/buffer/eviction_strategies/lru_eviction.hpp
     storage/buffer/eviction_strategies/second_chance_eviction.cpp
     storage/buffer/eviction_strategies/second_chance_eviction.hpp
     storage/buffer/eviction_strategies/sieve_eviction.cpp
