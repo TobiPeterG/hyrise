@@ -24,6 +24,11 @@ constexpr std::size_t SIEVE_MAX_SKIP = 16;
 constexpr std::size_t SIEVE_SCAN_MULTIPLIER_MIN = 2;
 constexpr std::size_t SIEVE_SCAN_MULTIPLIER_MAX = 8;
 
+// Tombstone compaction should be very rare.
+// We only compact if the existing tombstone thresholds trigger AND we have done enough ops since last compaction.
+constexpr std::size_t SIEVE_MIN_OPS_BETWEEN_COMPACTIONS = 1u << 16;  // 65536
+constexpr std::size_t SIEVE_MIN_TOMBSTONES_FOR_COMPACTION = 1024;
+
 }  // namespace
 
 SieveEviction::SieveEviction(BufferPool& buffer_pool) : EvictionStrategy(buffer_pool), _hand(0) {}
@@ -120,6 +125,7 @@ void SieveEviction::_invalidate_at_locked(const std::size_t idx) {
     DebugAssert(_live_entries > 0, "live entry underflow");
     --_live_entries;
     ++_tombstones;
+    ++_ops_since_compaction;
   }
 }
 
@@ -162,6 +168,7 @@ void SieveEviction::_compact_if_needed_locked() {
 
   _eviction_vector.swap(compacted);
   _tombstones = 0;
+  _ops_since_compaction = 0;
 
   // Reset hand to head (end) as in add_eviction_candidate when list becomes non-empty.
   if (_live_entries > 0 && !_eviction_vector.empty()) {
@@ -169,6 +176,24 @@ void SieveEviction::_compact_if_needed_locked() {
   } else {
     _hand.store(0, std::memory_order_relaxed);
   }
+}
+
+void SieveEviction::_maybe_compact_rarely_locked() {
+  // Never compact while someone might still rely on a previously picked vector index.
+  if (_in_flight_picks > 0) {
+    return;
+  }
+
+  // Make compaction very rare
+  if (_ops_since_compaction < SIEVE_MIN_OPS_BETWEEN_COMPACTIONS) {
+    return;
+  }
+
+  if (_tombstones < SIEVE_MIN_TOMBSTONES_FOR_COMPACTION) {
+    return;
+  }
+
+  _compact_if_needed_locked();
 }
 
 bool SieveEviction::_pick_current_candidate_locked(std::size_t& out_idx, EvictionItem& out_item) {
@@ -244,12 +269,17 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
          ++scans) {
       std::size_t this_idx = 0;
       EvictionItem item{};
+      bool picked = false;
 
       {
         std::lock_guard<std::mutex> lk(_mutex);
         if (!_pick_current_candidate_locked(this_idx, item)) {
           break;
         }
+        // rom here until we re-acquire _mutex and "finish" this attempt,
+        // we must not compact because we hold an index into _eviction_vector.
+        ++_in_flight_picks;
+        picked = true;
       }
 
       increment_counter(_buffer_pool.metrics->num_eviction_candidate_inspections);
@@ -261,6 +291,10 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
       // Migrated entry -> tombstone (only if identity still matches slot)
       if (frame->node_id() != _buffer_pool.node_id) {
         std::lock_guard<std::mutex> lk(_mutex);
+
+        DebugAssert(_in_flight_picks > 0, "in-flight picks underflow");
+        --_in_flight_picks;
+
         if (this_idx < _eviction_vector.size()) {
           auto& slot = _eviction_vector[this_idx];
           if (slot.valid && slot.item.page_id == item.page_id && slot.item.timestamp == item.timestamp) {
@@ -270,12 +304,18 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
             (void)_advance_hand_to_prev_valid_locked();
           }
         }
+
+        _maybe_compact_rarely_locked();
         continue;
       }
 
       // Stale entry -> tombstone (only if identity still matches slot)
       if (Frame::version(current_state_and_version) != item.timestamp) {
         std::lock_guard<std::mutex> lk(_mutex);
+
+        DebugAssert(_in_flight_picks > 0, "in-flight picks underflow");
+        --_in_flight_picks;
+
         if (this_idx < _eviction_vector.size()) {
           auto& slot = _eviction_vector[this_idx];
           if (slot.valid && slot.item.page_id == item.page_id && slot.item.timestamp == item.timestamp) {
@@ -285,6 +325,8 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
             (void)_advance_hand_to_prev_valid_locked();
           }
         }
+
+        _maybe_compact_rarely_locked();
         continue;
       }
 
@@ -293,6 +335,10 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
         increment_counter(_buffer_pool.metrics->num_eviction_requeues_pinned);
 
         std::lock_guard<std::mutex> lk(_mutex);
+
+        DebugAssert(_in_flight_picks > 0, "in-flight picks underflow");
+        --_in_flight_picks;
+
         if (_live_entries > 0 && !_eviction_vector.empty()) {
           if (this_idx == pinned_last_idx) {
             ++pinned_streak;
@@ -303,6 +349,8 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
           const auto skip = adaptive_skip(SIEVE_BASE_SKIP_ON_PINNED, SIEVE_MAX_SKIP, pinned_streak);
           (void)_advance_hand_skip_and_find_prev_valid_from_locked(this_idx, skip);
         }
+
+        _maybe_compact_rarely_locked();
         continue;
       }
 
@@ -318,9 +366,15 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
         lockfail_streak = 0;
 
         std::lock_guard<std::mutex> lk(_mutex);
+
+        DebugAssert(_in_flight_picks > 0, "in-flight picks underflow");
+        --_in_flight_picks;
+
         if (_live_entries > 0 && !_eviction_vector.empty()) {
           (void)_advance_hand_skip_and_find_prev_valid_from_locked(this_idx, SIEVE_SKIP_ON_REFERENCED);
         }
+
+        _maybe_compact_rarely_locked();
         continue;
       }
 
@@ -329,6 +383,10 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
         increment_counter(_buffer_pool.metrics->num_eviction_requeues_lock_failed);
 
         std::lock_guard<std::mutex> lk(_mutex);
+
+        DebugAssert(_in_flight_picks > 0, "in-flight picks underflow");
+        --_in_flight_picks;
+
         if (_live_entries > 0 && !_eviction_vector.empty()) {
           if (this_idx == lockfail_last_idx) {
             ++lockfail_streak;
@@ -339,6 +397,8 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
           const auto skip = adaptive_skip(SIEVE_BASE_SKIP_ON_LOCKFAIL, SIEVE_MAX_SKIP, lockfail_streak);
           (void)_advance_hand_skip_and_find_prev_valid_from_locked(this_idx, skip);
         }
+
+        _maybe_compact_rarely_locked();
         continue;
       }
 
@@ -348,8 +408,13 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
       // Tombstone under lock, then evict without holding SIEVE lock.
       {
         std::lock_guard<std::mutex> lk(_mutex);
+
+        DebugAssert(_in_flight_picks > 0, "in-flight picks underflow");
+        --_in_flight_picks;
+
         if (_live_entries == 0 || _eviction_vector.empty() || this_idx >= _eviction_vector.size()) {
           frame->unlock_exclusive();
+          _maybe_compact_rarely_locked();
           continue;
         }
 
@@ -361,10 +426,14 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
           if (_live_entries > 0) {
             (void)_advance_hand_to_prev_valid_locked();
           }
+          _maybe_compact_rarely_locked();
           continue;
         }
 
         _invalidate_at_and_advance_locked(this_idx);
+
+        // We intentionally compact very rarely; do not compact here unconditionally.
+        _maybe_compact_rarely_locked();
       }
 
       // Successful eviction resets hotspot streaks (we made progress)
@@ -381,6 +450,14 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
       evicted_in_this_round = true;
       evicted_any_in_call = true;
     }
+
+    // If we broke out of the inner loop after picking, we must never leave with in-flight picks.
+#ifndef NDEBUG
+    {
+      std::lock_guard<std::mutex> lk(_mutex);
+      DebugAssert(_in_flight_picks == 0, "perform_evictions returned to outer loop with in-flight picks");
+    }
+#endif
 
     // If still oversubscribed:
     if (_buffer_pool.used_bytes.load(std::memory_order_relaxed) > _buffer_pool.max_bytes) {
@@ -440,11 +517,14 @@ void SieveEviction::purge_eviction_candidates() {
   for (auto i = std::size_t{0}; i < MAX_EVICTION_QUEUE_PURGES; ++i) {
     std::size_t idx = 0;
     EvictionItem item{};
+    bool picked = false;
 
     {
       std::lock_guard<std::mutex> lk(_mutex);
       if (!_pick_current_candidate_locked(idx, item))
         return;
+      ++_in_flight_picks;
+      picked = true;
     }
 
     const auto region = _buffer_pool.volatile_regions[static_cast<uint64_t>(item.page_id.size_type())];
@@ -454,6 +534,10 @@ void SieveEviction::purge_eviction_candidates() {
     // Purge stale or migrated entries.
     if (frame->node_id() != _buffer_pool.node_id || Frame::version(current_state_and_version) != item.timestamp) {
       std::lock_guard<std::mutex> lk(_mutex);
+
+      DebugAssert(_in_flight_picks > 0, "in-flight picks underflow");
+      --_in_flight_picks;
+
       if (idx < _eviction_vector.size()) {
         auto& slot = _eviction_vector[idx];
         if (slot.valid && slot.item.page_id == item.page_id && slot.item.timestamp == item.timestamp) {
@@ -464,10 +548,19 @@ void SieveEviction::purge_eviction_candidates() {
         }
       }
       --i;
+
+      _maybe_compact_rarely_locked();
       continue;
     }
 
     // Keep pinned and referenced frames; SIEVE handles referenced via scan/clear in perform_evictions().
+    {
+      std::lock_guard<std::mutex> lk(_mutex);
+      DebugAssert(_in_flight_picks > 0, "in-flight picks underflow");
+      --_in_flight_picks;
+
+      _maybe_compact_rarely_locked();
+    }
   }
 }
 

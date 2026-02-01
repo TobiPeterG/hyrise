@@ -51,6 +51,10 @@ class SieveEviction : public EvictionStrategy {
   // Compacts away tombstones. Must be called with lock held.
   void _compact_if_needed_locked();
 
+  // Maybe compact away tombstones. Must be called with lock held.
+  // Only compacts when no thread holds an "in-flight" picked index.
+  void _maybe_compact_rarely_locked();
+
   // Returns false if there is no valid candidate. If true, outputs (idx,item).
   bool _pick_current_candidate_locked(std::size_t& out_idx, EvictionItem& out_item);
 
@@ -65,6 +69,13 @@ class SieveEviction : public EvictionStrategy {
 
   // Number of tombstones. Protected by _mutex.
   std::size_t _tombstones{0};
+
+  // Number of threads that have picked an (idx,item) under _mutex and are currently operating without holding _mutex.
+  // As long as this is > 0, we MUST NOT compact, because compaction reorders indices and would invalidate `idx`.
+  std::size_t _in_flight_picks{0};
+
+  // Best-effort rate limiter so compaction happens very rarely.
+  std::size_t _ops_since_compaction{0};
 
   mutable std::mutex _mutex;
 };
