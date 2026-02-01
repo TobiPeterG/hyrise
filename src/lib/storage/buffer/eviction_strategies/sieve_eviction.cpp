@@ -74,13 +74,20 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
 
   // We must ensure progress: if everything is pinned / constantly referenced / lock-failing,
   // do a bounded scan and fail (rolling back the reservation) rather than spinning forever.
+  bool counted_episode = false;
   while (_buffer_pool.used_bytes.load(std::memory_order_relaxed) > _buffer_pool.max_bytes) {
+    if (!counted_episode) {
+      increment_counter(_buffer_pool.metrics->num_oversubscription_episodes);
+      counted_episode = true;
+    }
+
     // Bound the number of "inspections" per oversubscription episode.
     // 2x is usually enough to clear references once and come back around.
     std::size_t max_scans = 0;
     {
       std::shared_lock shared_lock{_mutex};
       if (_eviction_vector.empty()) {
+        increment_counter(_buffer_pool.metrics->num_eviction_failures);
         _buffer_pool.free_bytes(bytes_required);
         return false;
       }
@@ -93,6 +100,7 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
       std::shared_lock shared_lock{_mutex};
 
       if (_eviction_vector.empty()) {
+        increment_counter(_buffer_pool.metrics->num_eviction_failures);
         _buffer_pool.free_bytes(bytes_required);
         return false;
       }
@@ -101,6 +109,8 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
       // Our hand moves from head toward tail by decrementing index with wrap.
       const auto this_hand = _hand.load(std::memory_order_relaxed) % _eviction_vector.size();
       const auto item = _eviction_vector[this_hand];
+
+      increment_counter(_buffer_pool.metrics->num_eviction_candidate_inspections);
 
       const auto region = _buffer_pool.volatile_regions[static_cast<uint64_t>(item.page_id.size_type())];
       auto frame = region->get_frame(item.page_id);
@@ -120,6 +130,7 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
 
       // Not evictable now (pinned / locked) -> advance hand under unique lock
       if (Frame::state(current_state_and_version) != Frame::UNLOCKED) {
+        increment_counter(_buffer_pool.metrics->num_eviction_requeues_pinned);
         shared_lock.unlock();
         std::unique_lock unique_lock{_mutex};
         _advance_hand_locked();
@@ -128,6 +139,7 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
 
       // SIEVE visited/reference bit: clear on first visit, keep item in place, advance hand.
       if (Frame::is_referenced(current_state_and_version)) {
+        increment_counter(_buffer_pool.metrics->num_eviction_requeues_referenced);
         frame->clear_reference();
         shared_lock.unlock();
         std::unique_lock unique_lock{_mutex};
@@ -137,6 +149,7 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
 
       // Try locking the frame exclusively; if it fails, advance hand and retry.
       if (!frame->try_lock_exclusive(current_state_and_version)) {
+        increment_counter(_buffer_pool.metrics->num_eviction_requeues_lock_failed);
         shared_lock.unlock();
         std::unique_lock unique_lock{_mutex};
         _advance_hand_locked();
@@ -178,6 +191,7 @@ bool SieveEviction::perform_evictions(const PageSizeType required_size) {
 
     // If we're still oversubscribed after a bounded scan, abort
     if (_buffer_pool.used_bytes.load(std::memory_order_relaxed) > _buffer_pool.max_bytes) {
+      increment_counter(_buffer_pool.metrics->num_eviction_failures);
       _buffer_pool.free_bytes(bytes_required);
       return false;
     }

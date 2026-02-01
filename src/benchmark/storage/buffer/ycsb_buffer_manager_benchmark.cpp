@@ -73,6 +73,7 @@ inline MigrationPolicy to_migration_policy(const YCSBPolicyVariant v) {
 class YcsbTableOwner {
  public:
   YcsbTableOwner() = default;
+
   explicit YcsbTableOwner(boost::container::pmr::memory_resource* mr) : _mr(mr) {}
 
   YcsbTableOwner(const YcsbTableOwner&) = delete;
@@ -81,8 +82,10 @@ class YcsbTableOwner {
   YcsbTableOwner(YcsbTableOwner&& other) noexcept {
     *this = std::move(other);
   }
+
   YcsbTableOwner& operator=(YcsbTableOwner&& other) noexcept {
-    if (this == &other) return *this;
+    if (this == &other)
+      return *this;
     reset();
     _mr = other._mr;
     _table = std::move(other._table);
@@ -118,6 +121,7 @@ class YcsbTableOwner {
   YCSBTable& table() {
     return _table;
   }
+
   const YCSBTable& table() const {
     return _table;
   }
@@ -197,7 +201,7 @@ static void shared_clear() {
 }
 
 static inline uint64_t execute_ycsb_action_rng(const YCSBTable& table, BufferManager& buffer_manager,
-                                              const YSCBOperation& operation, std::mt19937_64& rng) {
+                                               const YSCBOperation& operation, std::mt19937_64& rng) {
   const auto [key, op_type] = operation;
   const auto [tuple_size, ptr] = table[key];
 
@@ -357,6 +361,51 @@ static void run_one_instance(benchmark::State& state, const std::string& evictio
     state.counters["latency_95percentile"] = hdr_value_at_percentile(shared->global_hist, 95.0);
     state.counters["bytes_written_to_ssd"] = bm.metrics()->total_bytes_copied_to_ssd.load();
     state.counters["bytes_read_from_ssd"] = bm.metrics()->total_bytes_copied_from_ssd.load();
+
+    // Eviction strategy diagnostics
+    const auto m = bm.metrics();
+    const auto dram = m->dram_buffer_pool_metrics;
+    const auto numa = m->numa_buffer_pool_metrics;
+
+    const auto load = [](const std::atomic_uint64_t& a) {
+      return static_cast<double>(a.load(std::memory_order_relaxed));
+    };
+
+    const auto dram_inspections = load(dram->num_eviction_candidate_inspections);
+    const auto numa_inspections = load(numa->num_eviction_candidate_inspections);
+
+    state.counters["evict_inspections_total"] = dram_inspections + numa_inspections;
+    state.counters["evict_inspections_dram"] = dram_inspections;
+    state.counters["evict_inspections_numa"] = numa_inspections;
+
+    state.counters["evict_requeues_pinned_total"] =
+        load(dram->num_eviction_requeues_pinned) + load(numa->num_eviction_requeues_pinned);
+    state.counters["evict_requeues_ref_total"] =
+        load(dram->num_eviction_requeues_referenced) + load(numa->num_eviction_requeues_referenced);
+    state.counters["evict_requeues_lockfail_total"] =
+        load(dram->num_eviction_requeues_lock_failed) + load(numa->num_eviction_requeues_lock_failed);
+
+    state.counters["evict_failures_total"] = load(dram->num_eviction_failures) + load(numa->num_eviction_failures);
+
+    state.counters["evict_episodes_total"] =
+        load(dram->num_oversubscription_episodes) + load(numa->num_oversubscription_episodes);
+
+    state.counters["evictions_total"] = load(dram->num_evictions) + load(numa->num_evictions);
+    state.counters["evict_queue_adds_total"] =
+        load(dram->num_eviction_queue_adds) + load(numa->num_eviction_queue_adds);
+    state.counters["evict_queue_purged_total"] =
+        load(dram->num_eviction_queue_items_purged) + load(numa->num_eviction_queue_items_purged);
+
+    // derived ratios
+    const auto evictions_total = state.counters["evictions_total"];
+    if (evictions_total > 0.0) {
+      state.counters["evict_inspections_per_eviction"] = state.counters["evict_inspections_total"] / evictions_total;
+      state.counters["evict_requeues_pinned_per_eviction"] =
+          state.counters["evict_requeues_pinned_total"] / evictions_total;
+      state.counters["evict_requeues_ref_per_eviction"] = state.counters["evict_requeues_ref_total"] / evictions_total;
+      state.counters["evict_requeues_lockfail_per_eviction"] =
+          state.counters["evict_requeues_lockfail_total"] / evictions_total;
+    }
   }
 
   {
@@ -414,10 +463,10 @@ void register_one_ycsb_benchmark_for_strategy_and_policy(const std::string& stra
            strategy_name;
   }
 
-  auto* b = benchmark::RegisterBenchmark(
-      name.c_str(), [strategy_name, policy_variant, force_no_numa](benchmark::State& state) {
-        run_one_instance<WL>(state, strategy_name, policy_variant, force_no_numa);
-      });
+  auto* b = benchmark::RegisterBenchmark(name.c_str(),
+                                         [strategy_name, policy_variant, force_no_numa](benchmark::State& state) {
+                                           run_one_instance<WL>(state, strategy_name, policy_variant, force_no_numa);
+                                         });
 
   configure_common(b);
 }
@@ -431,10 +480,10 @@ void register_all_workloads_for_strategy(const std::string& strategy_name) {
 
 void register_all_workloads_no_numa_for_strategy(const std::string& strategy_name) {
   // Policy is forced to DramOnly inside the harness when force_no_numa=true
-  register_one_ycsb_benchmark_for_strategy_and_policy<YCSBWorkload::UpdateHeavy>(
-      strategy_name, YCSBPolicyVariant::DramOnly, true);
-  register_one_ycsb_benchmark_for_strategy_and_policy<YCSBWorkload::ReadMostly>(
-      strategy_name, YCSBPolicyVariant::DramOnly, true);
+  register_one_ycsb_benchmark_for_strategy_and_policy<YCSBWorkload::UpdateHeavy>(strategy_name,
+                                                                                 YCSBPolicyVariant::DramOnly, true);
+  register_one_ycsb_benchmark_for_strategy_and_policy<YCSBWorkload::ReadMostly>(strategy_name,
+                                                                                YCSBPolicyVariant::DramOnly, true);
   register_one_ycsb_benchmark_for_strategy_and_policy<YCSBWorkload::Scan>(strategy_name, YCSBPolicyVariant::DramOnly,
                                                                           true);
 }
@@ -444,7 +493,8 @@ void register_all_ycsb_benchmarks_for_all_strategies() {
 
   // If there are no strategies registered, registering nothing is less confusing
   // than registering a broken benchmark.
-  if (strategy_names.empty()) return;
+  if (strategy_names.empty())
+    return;
 
   for (const auto& strategy_name : strategy_names) {
     // NUMA-capable family

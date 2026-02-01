@@ -32,7 +32,13 @@ bool SecondChanceEviction::perform_evictions(const PageSizeType required_size) {
 
   // Find potential victim frame if we don't have enough space left
   // TODO: Verify, that this is correct
+  bool counted_episode = false;
   while (_buffer_pool.used_bytes.load(std::memory_order_relaxed) > _buffer_pool.max_bytes) {
+    if (!counted_episode) {
+      increment_counter(_buffer_pool.metrics->num_oversubscription_episodes);
+      counted_episode = true;
+    }
+
     if (!_eviction_queue.try_pop(item)) {
 #ifndef NDEBUG
       std::cerr << "[BM][DEBUG] ensure_free_pages failed: eviction_queue empty"
@@ -41,9 +47,12 @@ bool SecondChanceEviction::perform_evictions(const PageSizeType required_size) {
                 << " max_bytes=" << _buffer_pool.max_bytes << " freed_bytes=" << freed_bytes
                 << " node_id=" << _buffer_pool.node_id << "\n";
 #endif
+      increment_counter(_buffer_pool.metrics->num_eviction_failures);
       _buffer_pool.free_bytes(bytes_required);
       return false;
     }
+
+    increment_counter(_buffer_pool.metrics->num_eviction_candidate_inspections);
 
     auto region = _buffer_pool.volatile_regions[static_cast<uint64_t>(item.page_id.size_type())];
     auto frame = region->get_frame(item.page_id);
@@ -62,12 +71,14 @@ bool SecondChanceEviction::perform_evictions(const PageSizeType required_size) {
 
     // Keep pinned frames in the list; skip by requeueing.
     if (Frame::state(current_state_and_version) != Frame::UNLOCKED) {
+      increment_counter(_buffer_pool.metrics->num_eviction_requeues_pinned);
       _eviction_queue.push(item);
       continue;
     }
 
     // Second chance
     if (Frame::is_referenced(current_state_and_version)) {
+      increment_counter(_buffer_pool.metrics->num_eviction_requeues_referenced);
       frame->clear_reference();
       _eviction_queue.push(item);
       continue;
@@ -75,6 +86,7 @@ bool SecondChanceEviction::perform_evictions(const PageSizeType required_size) {
 
     // Try locking the frame exclusively
     if (!frame->try_lock_exclusive(current_state_and_version)) {
+      increment_counter(_buffer_pool.metrics->num_eviction_requeues_lock_failed);
       _eviction_queue.push(item);
       continue;
     }

@@ -16,6 +16,25 @@ struct BufferPoolMetrics {
 
   // peak resident objects observed
   std::atomic_uint64_t peak_resident_objects = 0;
+
+  // How many eviction candidates were inspected (i.e., "looked at") while trying to evict.
+  // This is useful to understand whether the strategy is doing lots of useless work (e.g., many pinned/ref frames).
+  std::atomic_uint64_t num_eviction_candidate_inspections = 0;
+
+  // How often we had to requeue a candidate because it was pinned (not UNLOCKED).
+  std::atomic_uint64_t num_eviction_requeues_pinned = 0;
+
+  // How often we had to requeue a candidate because it was referenced / had non-zero ref level.
+  std::atomic_uint64_t num_eviction_requeues_referenced = 0;
+
+  // How often we had to requeue/skip because exclusive lock acquisition failed.
+  std::atomic_uint64_t num_eviction_requeues_lock_failed = 0;
+
+  // How often eviction could not make progress (e.g., empty queue / bounded scan abort).
+  std::atomic_uint64_t num_eviction_failures = 0;
+
+  // How often we entered an oversubscription episode (i.e., used_bytes > max_bytes and had to evict).
+  std::atomic_uint64_t num_oversubscription_episodes = 0;
 };
 
 // TODO: Add
