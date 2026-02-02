@@ -1,11 +1,5 @@
 #include "buffer_pool.hpp"
 
-#include <storage/buffer/eviction_strategies/delayed_fifo_reinsertion_eviction.hpp>
-#include <storage/buffer/eviction_strategies/fifo_eviction.hpp>
-#include <storage/buffer/eviction_strategies/lru_eviction.hpp>
-#include <storage/buffer/eviction_strategies/second_chance_eviction.hpp>
-#include <storage/buffer/eviction_strategies/sieve_eviction.hpp>
-
 #include <algorithm>
 
 #include "metrics.hpp"
