@@ -9,16 +9,19 @@ namespace hyrise {
 namespace {
 EvictionStrategyRegistrar s_s3_fifo_registrar{
   "s3_fifo",
-  [](BufferPool& buffer_pool) { return std::make_unique<S3_FifoEviction>(buffer_pool, 0.1, 0.9, 1); },
+  [](BufferPool& buffer_pool) { return std::make_unique<S3_FifoEviction>(buffer_pool, 0.9, 1); },
   {"S3_FIFO"}};
+
+EvictionStrategyRegistrar s_s3_fifo_registrar_multi_bit{
+  "s3_fifo_multi_bit",
+  [](BufferPool& buffer_pool) { return std::make_unique<S3_FifoEviction>(buffer_pool, 0.9, 2); },
+  {"S3_FIFO_MULTI_BIT", "S3_FIFO_MULTIBIT"}};
 }
 
-S3_FifoEviction::S3_FifoEviction(BufferPool& buffer_pool, const float small_queue_ratio, const float main_queue_ratio, const uint8_t num_frequency_bits)
-: EvictionStrategy(buffer_pool), _small_queue_ratio(small_queue_ratio), _main_queue_ratio(main_queue_ratio),
+S3_FifoEviction::S3_FifoEviction(BufferPool& buffer_pool, const float main_queue_ratio, const uint8_t num_frequency_bits)
+: EvictionStrategy(buffer_pool), _small_queue_ratio(1 - main_queue_ratio), _main_queue_ratio(main_queue_ratio),
 _full_capacity(_buffer_pool.max_bytes / bytes_for_size_type(PageSizeType::KiB4)),
 _ghost_queue_capacity(std::max(static_cast<uint64_t>(static_cast<float>(_full_capacity) * _main_queue_ratio), uint64_t{1})),
-_small_queue_capacity(std::max(static_cast<uint64_t>(static_cast<float>(_full_capacity) * _small_queue_ratio), uint64_t{1})),
-_main_queue_capacity(std::max(static_cast<uint64_t>(static_cast<float>(_full_capacity) * _main_queue_ratio), uint64_t{1})),
 _max_frequency((0b1U << num_frequency_bits) - 1),
 _ghost_queue(PageIDComparator{_ghost_queue_capacity}) {}
 
@@ -43,33 +46,37 @@ bool S3_FifoEviction::perform_evictions(const PageSizeType required_size) {
   const auto bytes_required = bytes_for_size_type(required_size);
 
   _buffer_pool.reserve_bytes(bytes_required);
+  const auto combined_size = _small_queue.unsafe_size() + _main_queue.unsafe_size();
+  const auto combined_size_d = static_cast<double>(combined_size);
+  const auto small_queue_expected_size = static_cast<std::size_t>(combined_size_d * _small_queue_ratio);
 
-  if (_small_queue.unsafe_size() >= _small_queue_capacity) {
-    evict_from_small_queue();
-  } else {
-    evict_from_main_queue();
+  while (_buffer_pool.used_bytes.load(std::memory_order_relaxed) > _buffer_pool.max_bytes) {
+    bool successful = false;
+    if (_small_queue.unsafe_size() >= small_queue_expected_size || _main_queue.unsafe_size() == 0) {
+      successful |= evict_from_small_queue();
+    } else {
+      successful |= evict_from_main_queue();
+    }
+
+    if (!successful) {
+      increment_counter(_buffer_pool.metrics->num_eviction_failures);
+      _buffer_pool.free_bytes(bytes_required);
+      return false;
+    }
   }
 
-  const auto enough_evicted = _buffer_pool.used_bytes.load(std::memory_order_relaxed) <= _buffer_pool.max_bytes;
-  if (enough_evicted) {
-    return true;
-  } else {
-    increment_counter(_buffer_pool.metrics->num_eviction_failures);
-    _buffer_pool.free_bytes(bytes_required);
-    return false;
-  }
+  return true;
 }
 
 void S3_FifoEviction::on_access(const PageID& /*unused*/, Frame* frame) {
   frame->inc_reference_level_saturating(_max_frequency);
 }
 
-void S3_FifoEviction::evict_from_small_queue() {
-  bool evicted = false;
-  while (!evicted && _small_queue.unsafe_size() > 0) {
+bool S3_FifoEviction::evict_from_small_queue() {
+  while (true) {
     EvictionItem eviction_item;
     if (!_small_queue.try_pop(eviction_item)) {
-      continue;
+      return false;
     }
 
     increment_counter(_buffer_pool.metrics->num_eviction_candidate_inspections);
@@ -108,22 +115,20 @@ void S3_FifoEviction::evict_from_small_queue() {
 
       _buffer_pool.free_bytes(bytes_for_size_type(eviction_item.page_id.size_type()));
 
-      evicted = true;
+      return true;
     } else {
       _main_queue.push({.page_id = eviction_item.page_id, .timestamp = Frame::version(current_state_and_version)});
-      if (_main_queue.unsafe_size() > _main_queue_capacity) {
-        evict_from_main_queue();
-      }
+
+      return true;
     }
   }
 }
 
-void S3_FifoEviction::evict_from_main_queue() {
-  bool evicted = false;
-  while (!evicted && _main_queue.unsafe_size() > 0) {
+bool S3_FifoEviction::evict_from_main_queue() {
+  while (true) {
     EvictionItem eviction_item;
     if (!_main_queue.try_pop(eviction_item)) {
-      continue;
+      return false;
     }
 
     increment_counter(_buffer_pool.metrics->num_eviction_candidate_inspections);
@@ -158,7 +163,7 @@ void S3_FifoEviction::evict_from_main_queue() {
 
       _buffer_pool.free_bytes(bytes_for_size_type(eviction_item.page_id.size_type()));
 
-      evicted = true;
+      return true;
     } else {
       frame->dec_reference_level_if_positive();
       _main_queue.push({.page_id = eviction_item.page_id, .timestamp = Frame::version(current_state_and_version)});
