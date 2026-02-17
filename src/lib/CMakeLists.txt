@@ -500,6 +500,8 @@ set(
     storage/buffer/eviction_strategies/sieve_eviction.hpp
     storage/buffer/eviction_strategies/s3_fifo_eviction.cpp
     storage/buffer/eviction_strategies/s3_fifo_eviction.hpp
+    storage/buffer/eviction_strategies/random_eviction.cpp
+    storage/buffer/eviction_strategies/random_eviction.hpp
     storage/dictionary_segment.cpp
     storage/dictionary_segment.hpp
     storage/dictionary_segment/attribute_vector_iterable.hpp
