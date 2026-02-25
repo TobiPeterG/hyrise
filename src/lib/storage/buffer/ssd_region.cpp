@@ -59,11 +59,29 @@ int SSDRegion::open_file_descriptor_directory_file(const std::filesystem::path& 
 
 #elif __linux__
   // Real SSD directory mode: use O_DIRECT to bypass page cache.
-  // Caller must ensure filesystem supports O_DIRECT
+  // Some filesystems (e.g., tmpfs at /dev/shm) do not support O_DIRECT and return EINVAL.
+  // To allow using tmpfs for benchmarking / testing, fall back to buffered I/O if O_DIRECT is rejected.
   int flags = O_RDWR | O_CREAT | O_DIRECT;
-  const int fd = ::open(file_name.string().c_str(), flags, 0666);
+  int fd = ::open(file_name.string().c_str(), flags, 0666);
   if (fd < 0) {
     const auto e = errno;
+
+    // Common "direct I/O not supported here" errors. EINVAL is what tmpfs typically returns.
+    if (e == EINVAL || e == EOPNOTSUPP || e == ENOTTY) {
+#ifndef NDEBUG
+      std::cerr << "[BM][SSDRegion] O_DIRECT not supported for \"" << file_name.string() << "\" ("
+                << std::string(strerror(e)) << "), retrying without O_DIRECT\n";
+#endif
+      flags = O_RDWR | O_CREAT;  // buffered I/O fallback
+      fd = ::open(file_name.string().c_str(), flags, 0666);
+      if (fd >= 0) {
+        return fd;
+      }
+
+      const auto e2 = errno;
+      Fail("SSDRegion open failed for file " + file_name.string() + ": " + std::string(strerror(e2)));
+    }
+
     Fail("SSDRegion open failed for file " + file_name.string() + " with O_DIRECT: " + std::string(strerror(e)) +
          ". Ensure this directory is on an SSD filesystem that supports O_DIRECT.");
   }
