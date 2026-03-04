@@ -50,9 +50,10 @@ void DelayedFifoReinsertionEviction::on_access(const PageID& /*page_id*/, Frame*
   // Guard: last != 0 (first access / post-migration reset should not reward immediately)
   if (last != 0 && delta > delay_time) {
     frame->inc_reference_level_saturating(_max_freq());
+    // This is not actually the access time like the variable name suggests, but the last time it has been promoted
+    // We follow the naming proposed in the original paper presenting DFR
+    frame->set_last_access_time(now);
   }
-
-  frame->set_last_access_time(now);
 }
 
 void DelayedFifoReinsertionEviction::add_eviction_candidate(const PageID& page_id, Frame* const frame) {
